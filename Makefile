@@ -44,27 +44,26 @@ repl:
 test:
 	python3 tests/run_all.py
 
-# Package a ready-to-run copy of this app for the landing page's
-# "Buy Once" button (../admin/routes/downloads.py serves the result) — the
-# whole directory. Unlike core/pro, there's no seeded database file to bundle
-# — the database lives on Postgres, not in this directory — so unzip-and-run
-# still needs its own `createdb scalar` (or equivalent) and `make db-migrate`
-# before serving anything. .env is excluded: it's gitignored and per-install
-# already (see .env.example) — without one, utils.py falls back to its
-# documented dev SECRET_KEY, same as a fresh git clone.
+# Package a ready-to-run copy of this app — the whole directory. Unlike
+# core/pro, there's no seeded database file to bundle — the database lives
+# on Postgres, not in this directory — so unzip-and-run still needs its own
+# `createdb scalar` (or equivalent) and `make db-migrate` before serving
+# anything. .env is excluded: it's gitignored and per-install already (see
+# .env.example) — without one, utils.py falls back to its documented dev
+# SECRET_KEY, same as a fresh git clone.
 #
-# dist/ is gitignored — ../admin/routes/downloads.py runs this target itself
-# on the first production request for pro.zip and caches the result, so
-# there's nothing to remember to rebuild/commit here.
+# dist/ is gitignored. Unlike pro's own dist target, nothing in ../admin
+# serves this yet (../admin/routes/downloads.py only knows about pro.zip
+# today) — this just produces the zip locally, for now.
 dist:
 	mkdir -p dist
-	rm -f dist/pro.zip
-	cd .. && zip -rq pro/dist/pro.zip pro \
-		-x 'pro/.env' \
-		-x 'pro/__pycache__/*' -x 'pro/*/__pycache__/*' -x '*.pyc' \
-		-x 'pro/logs/*' \
-		-x 'pro/dist/*'
-	@echo "Built dist/pro.zip"
+	rm -f dist/enterprise.zip
+	cd .. && zip -rq enterprise/dist/enterprise.zip enterprise \
+		-x 'enterprise/.env' \
+		-x 'enterprise/__pycache__/*' -x 'enterprise/*/__pycache__/*' -x '*.pyc' \
+		-x 'enterprise/logs/*' \
+		-x 'enterprise/dist/*'
+	@echo "Built dist/enterprise.zip"
 
 # Full backup for disaster recovery / moving to a new host: the whole
 # directory zipped up — including .env and uploads/, unlike `dist` above
@@ -74,18 +73,18 @@ dist:
 # for exactly this: safe to run against a live database, no locking out
 # writers.
 #
-# Written to backups/pro-<timestamp>.zip so repeated runs don't clobber
-# each other; backups/ is gitignored, same as dist/.
+# Written to backups/enterprise-<timestamp>.zip so repeated runs don't
+# clobber each other; backups/ is gitignored, same as dist/.
 backup:
 	mkdir -p $(BACKUP_DIR)
 	tmp=$$(mktemp -d) && \
-	mkdir -p $$tmp/pro && \
-	python3 backup.py $$tmp/pro/db.dump && \
-	cd .. && zip -rq pro/$(BACKUP_DIR)/pro-$(TS).zip pro \
-		-x 'pro/__pycache__/*' -x 'pro/*/__pycache__/*' -x '*.pyc' \
-		-x 'pro/dist/*' -x 'pro/$(BACKUP_DIR)/*' && \
-	cd $$tmp && zip -q $(CURDIR)/$(BACKUP_DIR)/pro-$(TS).zip pro/db.dump && \
+	mkdir -p $$tmp/enterprise && \
+	python3 backup.py $$tmp/enterprise/db.dump && \
+	cd .. && zip -rq enterprise/$(BACKUP_DIR)/enterprise-$(TS).zip enterprise \
+		-x 'enterprise/__pycache__/*' -x 'enterprise/*/__pycache__/*' -x '*.pyc' \
+		-x 'enterprise/dist/*' -x 'enterprise/$(BACKUP_DIR)/*' && \
+	cd $$tmp && zip -q $(CURDIR)/$(BACKUP_DIR)/enterprise-$(TS).zip enterprise/db.dump && \
 	rm -rf $$tmp
-	@echo "Wrote $(BACKUP_DIR)/pro-$(TS).zip"
+	@echo "Wrote $(BACKUP_DIR)/enterprise-$(TS).zip"
 
 .DEFAULT_GOAL := run
