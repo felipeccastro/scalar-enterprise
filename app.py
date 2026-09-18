@@ -1,9 +1,9 @@
 """Bottle app factory/bootstrap.
 
 Single-tenant template app — no workspace/multi-tenancy concept anywhere.
-Zero pip dependencies beyond peewee + bottle (see requirements.txt); the
-session, CSRF, password hashing, mailer, and Ask-AI HTTP calls are all
-hand-rolled or stdlib (see utils.py / ai.py).
+One real pip dependency, psycopg2 (the Postgres driver — see models.py and
+requirements.txt); the session, CSRF, password hashing, mailer, and Ask-AI
+HTTP calls are all hand-rolled or stdlib (see utils.py / ai.py).
 """
 
 from __future__ import annotations
@@ -291,9 +291,9 @@ def _health():
     process manager, a load balancer, admin's launcher — see
     admin/launcher/provisioner.py's own _health_check, which currently just
     polls `/`). 200 only if the app can actually reach its database, not
-    merely that the process is listening — a wedged/corrupted SQLite file
-    or a lock that never clears would still answer `/` (it's mostly static
-    HTML) while every real page silently 500s underneath it.
+    merely that the process is listening — an unreachable Postgres server
+    or an exhausted connection pool would still answer `/` (it's mostly
+    static HTML) while every real page silently 500s underneath it.
 
     Public (see PUBLIC_ROUTES in utils.py) and exempt from the
     pre-registration bootstrap redirect (see pages/__init__.py): a freshly

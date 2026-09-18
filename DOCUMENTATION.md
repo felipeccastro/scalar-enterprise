@@ -36,10 +36,11 @@ one team — there's no workspace/org switcher; whoever signs up first is the
 owner, and everyone else joins by invite.
 
 Server-rendered [Bottle](https://bottlepy.org) + [peewee](http://docs.peewee-orm.com)
-over SQLite, styled with the [oat.css](https://oat.style) design-system
-library. No build step, no Node, no pip install for the app itself — bottle
-and peewee are vendored as plain `.py` files in `vendor/`. See the
-[README](README.md) for how to run it.
+over Postgres, styled with the [oat.css](https://oat.style) design-system
+library. No build step, no Node — bottle and peewee are vendored as plain
+`.py` files in `vendor/` — but this tier does need one real pip install:
+`psycopg2` (the Postgres driver). See the [README](README.md) for how to
+run it.
 
 ## Accounts, team & access
 
@@ -425,7 +426,7 @@ only) — see [Settings & appearance](#settings--appearance).
 | Var | Purpose |
 |---|---|
 | `SECRET_KEY` | Signs the session cookie. Set a real value in production. |
-| `SQLITE_PATH` | DB file location (default `app.db` next to `models.py`). |
+| `PGHOST` / `PGPORT` / `PGDATABASE` / `PGUSER` / `PGPASSWORD` | Postgres connection (defaults: `localhost`, `5432`, `scalar`, unset/unset). |
 | `UPLOAD_FOLDER` | Attachment storage root (default `./uploads`). |
 | `OPENAI_API_KEY` / `OPENAI_MODEL` / `OPENAI_BASE_URL` | Ask AI, cloud backend. |
 | `OLLAMA_HOST` / `OLLAMA_MODEL` | Ask AI, local backend (used when `OPENAI_API_KEY` is unset). |

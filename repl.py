@@ -75,11 +75,15 @@ if __name__ == "__main__":
     db.connect(reuse_if_open=True)
 
     banner = (
-        "Scalar Pro REPL — db: {db_path}\n"
+        "Scalar Pro REPL — db: {db_url}\n"
         "Preloaded: db, {models}\n"
         "Migrations are NOT applied here — run `make db-migrate` first if one is pending."
     ).format(
-        db_path=os.environ.get("SQLITE_PATH", "app.db"),
+        db_url="{}@{}:{}".format(
+            os.environ.get("PGDATABASE", "scalar"),
+            os.environ.get("PGHOST", "localhost"),
+            os.environ.get("PGPORT", 5432),
+        ),
         models=", ".join(m.__name__ for m in _MODELS),
     )
     code.interact(banner=banner, local=globals())

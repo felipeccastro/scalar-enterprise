@@ -5,11 +5,11 @@ notifications, and a read/write **Ask AI** chat assistant — meant as a
 starting point to fork and build on, not as a product of its own.
 
 Server-rendered [Bottle](https://bottlepy.org) + [peewee](http://docs.peewee-orm.com)
-over SQLite. No build step, no Node, and no `pip install` needed for the app
-itself — `bottle` and `peewee` are vendored as plain `.py` files under
-`vendor/` (MIT-licensed; see `vendor/LICENSE.*`). Styling comes from the
-[oat.css](https://oat.style) design-system library (also vendored),
-retthemed in `static/style.css`.
+over Postgres. No build step, no Node — `bottle` and `peewee` are vendored as
+plain `.py` files under `vendor/` (MIT-licensed; see `vendor/LICENSE.*`) —
+but the Postgres driver, `psycopg2`, is a real `pip install` (see
+Requirements below). Styling comes from the [oat.css](https://oat.style)
+design-system library (also vendored), retthemed in `static/style.css`.
 
 - **What's built:** [DOCUMENTATION.md](DOCUMENTATION.md)
 - **Working on this app?** Read [AGENTS.md](AGENTS.md) first — in particular,
@@ -18,14 +18,20 @@ retthemed in `static/style.css`.
 ## Requirements
 
 - Python 3.10+ (the code uses `X | None` type syntax).
-- No external services required to run it. Optional integrations (AI chat,
-  outbound email) degrade gracefully when unconfigured — see
-  [Configuration](#configuration) below.
+- A local Postgres server, with a `scalar` database created ahead of time:
+  `createdb scalar` (or `psql -c 'CREATE DATABASE scalar'`). Defaults assume
+  `localhost:5432`; see [Configuration](#configuration) to point elsewhere.
+- `pip install -r requirements.txt` — the Postgres driver (`psycopg2`)
+  isn't vendored, unlike `bottle`/`peewee`.
+- Optional integrations (AI chat, outbound email) degrade gracefully when
+  unconfigured — see [Configuration](#configuration) below.
 
 ## Quick start
 
 ```bash
-cp .env.example .env   # optional — sensible defaults work without it
+createdb scalar         # once, if it doesn't already exist
+cp .env.example .env    # optional — sensible defaults work without it
+pip install -r requirements.txt
 python3 app.py
 ```
 
@@ -38,7 +44,7 @@ the team's owner, and gets a couple of sample clients/tasks seeded in).
 under gunicorn instead:
 
 ```bash
-pip install gunicorn   # the one thing here that isn't vendored
+pip install gunicorn   # the one other thing here that isn't vendored
 make db-migrate        # apply migrations/ first — gunicorn workers assume the
                         # schema's already current, they don't check
 make                    # same as: make run
@@ -66,6 +72,9 @@ what you need. Full reference in
 [DOCUMENTATION.md § Configuration reference](DOCUMENTATION.md#configuration-reference).
 Highlights:
 
+- **Database** defaults to a local Postgres instance's `scalar` database on
+  the standard port (`PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD`) —
+  see Requirements above for creating it.
 - **Ask AI** works out of the box against a local [Ollama](https://ollama.com)
   install (`OLLAMA_HOST`/`OLLAMA_MODEL`); set `OPENAI_API_KEY` to use an
   OpenAI-compatible cloud API instead.
@@ -94,7 +103,8 @@ uploads/      # attachment storage (gitignored; see UPLOAD_FOLDER)
 Schema changes go through `migrations/`, not an idempotent startup check —
 pro's one deliberate divergence from core's zero-migrations-framework rule.
 `peewee-migrate` (and the slice of `playhouse` it needs) is vendored in
-`vendor/`, same as `bottle`/`peewee` — still no `pip install` required.
+`vendor/`, same as `bottle`/`peewee` — no extra `pip install` beyond
+`psycopg2` for the Postgres driver itself (see Requirements above).
 
 See [DOCUMENTATION.md](DOCUMENTATION.md) for what each page/feature actually
 does, and [AGENTS.md](AGENTS.md) for conventions to follow when changing any

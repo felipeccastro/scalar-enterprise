@@ -2,11 +2,18 @@
 file itself (leading underscore, same convention as pages/_shared.py).
 
 Each journey runs the *real* app, as a real web server, against a
-throwaway SQLite database, and drives it the way a person would: look at a
-page, fill in a form, submit it, see where it lands. No mocks, and no pip
-installs — this app is meant to run with nothing beyond python3 and its own
-vendored bottle/peewee, and these tests hold to the same rule (unittest,
-urllib, wsgiref — all standard library).
+throwaway Postgres database (created and dropped around the test, see
+_create_test_database/_drop_test_database below), and drives it the way a
+person would: look at a page, fill in a form, submit it, see where it
+lands. No mocks — unittest, urllib, wsgiref, all standard library — plus
+psycopg2 (this tier's one real pip dependency, see requirements.txt) to
+create/drop the throwaway database directly, ahead of anything peewee
+does.
+
+Requires a reachable Postgres server (PGHOST/PGPORT/PGUSER/PGPASSWORD, same
+defaults as models.py) with permission to CREATE DATABASE / DROP DATABASE —
+the same server the app itself would run against, not a separate test-only
+instance.
 
 A journey file is meant to run in *its own process* (`python3
 tests/test_x.py`, or see run_all.py, which does exactly that for every file
@@ -21,15 +28,86 @@ import http.cookiejar
 import os
 import re
 import sys
-import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
+import psycopg2
+
 PRO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load_dotenv() -> None:
+    """Same as app.py's/migrate.py's own _load_dotenv() — kept as a small,
+    separate copy here for the same reason migrate.py gives for its own.
+    Needed here (unlike before Postgres) because _pg_admin_connect() below
+    runs ahead of `import app`, the thing that would otherwise load .env
+    for us — PGUSER/PGPASSWORD have to be in os.environ before it connects."""
+    path = os.path.join(PRO_DIR, ".env")
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+
+
+_load_dotenv()
+
+
+def _pg_admin_connect():
+    """A connection to the "postgres" maintenance database — CREATE
+    DATABASE / DROP DATABASE can't run against the database being
+    created/dropped itself."""
+    return psycopg2.connect(
+        dbname="postgres",
+        host=os.environ.get("PGHOST", "localhost"),
+        port=int(os.environ.get("PGPORT", 5432)),
+        user=os.environ.get("PGUSER") or None,
+        password=os.environ.get("PGPASSWORD") or None,
+    )
+
+
+def _create_test_database(name: str) -> None:
+    conn = _pg_admin_connect()
+    conn.autocommit = True  # CREATE DATABASE can't run inside a transaction
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'CREATE DATABASE "{name}"')
+    finally:
+        conn.close()
+
+
+def _drop_test_database(name: str) -> None:
+    conn = _pg_admin_connect()
+    conn.autocommit = True  # same as above, plus each statement here needs to land immediately
+    try:
+        with conn.cursor() as cur:
+            # DROP DATABASE fails while any session is attached — the app's
+            # own connections close per-request (see app.py's
+            # before_request/after_request hooks) and jobs.py's poller
+            # closes between iterations, but this journey's background job
+            # thread (daemon, outlives tearDownClass) could still be mid-poll
+            # and holding one open. Force the issue rather than let a slow
+            # teardown fail run_all.py.
+            cur.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (name,),
+            )
+            cur.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    finally:
+        conn.close()
 
 
 class _QuietHandler(WSGIRequestHandler):
@@ -59,8 +137,9 @@ class Journey(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls._db_fd, cls._db_path = tempfile.mkstemp(prefix="pro_journey_", suffix=".db")
-        os.environ["SQLITE_PATH"] = cls._db_path
+        cls._db_name = f"scalar_journey_{uuid.uuid4().hex[:16]}"
+        _create_test_database(cls._db_name)
+        os.environ["PGDATABASE"] = cls._db_name
 
         sys.path.insert(0, PRO_DIR)
         sys.path.insert(0, os.path.join(PRO_DIR, "vendor"))
@@ -86,15 +165,7 @@ class Journey(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls._server.shutdown()
-        os.close(cls._db_fd)
-        # WAL mode (see models.py: make_database()) leaves a couple of
-        # companion files alongside the main one; all three are this
-        # journey's alone to clean up.
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                os.remove(cls._db_path + suffix)
-            except FileNotFoundError:
-                pass
+        _drop_test_database(cls._db_name)
 
     def setUp(self) -> None:
         self.browser = Browser(self.base_url)

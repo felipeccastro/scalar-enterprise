@@ -9,6 +9,10 @@ dependency story in AGENTS.md), applied by run_migrations() at startup (see
 the bottom of this file). This is pro's one deliberate divergence from
 core's zero-pip-dependency, no-migrations-framework rule — see
 AGENTS.md for why the tradeoff was worth it here and core stays as-is.
+
+Runs against Postgres, not SQLite (see make_database() below) — the one
+real pip dependency this tier carries (psycopg2-binary, see
+requirements.txt); everything else is still vendored.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from peewee import (
     ForeignKeyField,
     IntegerField,
     Model,
-    SqliteDatabase,
+    PostgresqlDatabase,
     TextField,
 )
 
@@ -36,46 +40,36 @@ from peewee import (
 db = DatabaseProxy()
 
 
-def make_database() -> SqliteDatabase:
-    """Build the concrete database. Local SQLite file, path overridable via
-    SQLITE_PATH (defaults to app.db next to this file).
+def make_database() -> PostgresqlDatabase:
+    """Build the concrete database: Postgres, via psycopg2 (see
+    requirements.txt — the one real pip dependency this tier carries).
 
-    Pragmas, and why each is here rather than left at SQLite's own default:
-    - journal_mode=wal: readers (most requests) don't block on a writer,
-      and vice versa — the default rollback journal takes an exclusive
-      lock for the whole write.
-    - synchronous=NORMAL: the pairing WAL mode's own docs recommend. Full
-      durability on every commit (the FULL default) costs an fsync per
-      write for a guarantee WAL already covers except across an actual OS
-      crash/power loss — an acceptable trade for a single-tenant app.
-    - foreign_keys=1: SQLite ignores FK constraints unless a connection
-      turns this on itself; without it, on_delete="CASCADE"/"SET NULL" in
-      models.py would be decoration, not enforced.
-    - busy_timeout=5000: retry for up to 5s on a locked database instead of
-      failing the request immediately. Single gunicorn worker or not (see
-      ../Makefile), jobs.py's reminder-polling thread and a request handler
-      both open their own connection to the same file, so brief contention
-      between them is real, not hypothetical.
-    - cache_size=-64000: a 64MB page cache (negative = KB, SQLite's own
-      convention), up from the ~2MB default — cheap on a server built for
-      this, and this database is read far more than it's written.
+    Connection params come from the standard libpq env vars, each with a
+    default that points at a local instance's "scalar" database on the
+    default port:
+    - PGHOST (default "localhost")
+    - PGPORT (default 5432)
+    - PGDATABASE (default "scalar")
+    - PGUSER / PGPASSWORD (unset by default — falls back to psycopg2/libpq's
+      own resolution: OS user, ~/.pgpass, etc.)
+
+    Create the database once, before the first `make db-migrate` /
+    `python3 app.py`: `createdb scalar` (or `psql -c 'CREATE DATABASE
+    scalar'`) — run_migrations() below owns the schema, not database
+    creation itself.
     """
-    sqlite_path = os.environ.get(
-        "SQLITE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.db")
-    )
-    return SqliteDatabase(
-        sqlite_path,
-        pragmas={
-            "journal_mode": "wal",
-            "synchronous": 1,  # NORMAL
-            "foreign_keys": 1,
-            "busy_timeout": 5000,
-            "cache_size": -64000,
-        },
-    )
+    kwargs = {
+        "host": os.environ.get("PGHOST", "localhost"),
+        "port": int(os.environ.get("PGPORT", 5432)),
+    }
+    if os.environ.get("PGUSER"):
+        kwargs["user"] = os.environ["PGUSER"]
+    if os.environ.get("PGPASSWORD"):
+        kwargs["password"] = os.environ["PGPASSWORD"]
+    return PostgresqlDatabase(os.environ.get("PGDATABASE", "scalar"), **kwargs)
 
 
-def init_database() -> SqliteDatabase:
+def init_database() -> PostgresqlDatabase:
     """Bind the proxy to the concrete backend. Idempotent."""
     if db.obj is None:
         db.initialize(make_database())
@@ -549,8 +543,12 @@ def _column_exists(table: str, column: str) -> bool:
     peewee-migrate's "fake" replay of already-applied migrations — under
     fake, Database.execute_sql is mocked out, so a real probe here would
     hit the mock rather than the actual table."""
-    cur = db.execute_sql(f"PRAGMA table_info({table})")
-    return any(row[1] == column for row in cur.fetchall())
+    cur = db.execute_sql(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s",
+        (table, column),
+    )
+    return cur.fetchone() is not None
 
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")

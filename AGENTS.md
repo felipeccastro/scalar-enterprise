@@ -65,16 +65,17 @@ stale and stops meaning anything.
 
 ## Conventions specific to this codebase
 
-- **Zero pip dependencies beyond gunicorn** (dev-only, for autoreload).
-  `bottle`/`peewee` are vendored as plain `.py` files in `vendor/`, and so is
-  `peewee-migrate` (plus the slice of `playhouse` it needs) — see the schema
-  bullet below and `vendor/LICENSE.peewee-migrate`. Don't add a pip
-  dependency without a good reason; if you must, note it in
-  `requirements.txt` the way the gunicorn line already does. If it's a
-  genuinely small, MIT/BSD-equivalent library, vendoring it (a real copy in
-  `vendor/`, its license alongside) is preferred over a pip dependency —
-  that's the whole reason this app has no `requirements.txt` entries beyond
-  gunicorn today.
+- **Pip dependencies are fine here, unlike core/pro.** This tier runs
+  against Postgres (see `models.py`), which needs `psycopg2-binary` — a
+  real pip dependency, listed in `requirements.txt` alongside the dev-only
+  `gunicorn` note. `bottle`/`peewee`/`peewee-migrate` (plus the slice of
+  `playhouse` it needs) stay vendored as plain `.py` files in `vendor/` —
+  see the schema bullet below and `vendor/LICENSE.peewee-migrate` — since
+  there's no reason to unvendor something that already works. But don't
+  feel obligated to vendor a *new* small library the way core/pro would;
+  add it to `requirements.txt` instead when that's the more natural fit
+  (e.g. it ships a C extension, like psycopg2 does, or vendoring it would
+  drag in its own dependency tree).
 - **No app-authored JS beyond what's declaratively necessary.** Mobile nav
   uses the checkbox hack; New Client/Task modals open via
   `commandfor`/`command="show-modal"`, wired by the already-vendored
@@ -160,15 +161,20 @@ stale and stops meaning anything.
   import SimpleTemplate; SimpleTemplate(open('templates/x.html').read())"`
   (run with `vendor/` on `sys.path`).
 - **Visual/behavioral changes**: run against a scratch database —
-  `SQLITE_PATH=/tmp/scratch.db PORT=8123 python3 app.py` — rather than the
-  real `app.db`, so local data doesn't need resetting afterward.
+  `createdb scratch && PGDATABASE=scratch PORT=8123 python3 app.py` —
+  rather than the real `scalar` database, so local data doesn't need
+  resetting afterward. `dropdb scratch` when done.
 - **End-to-end**: `python3 tests/run_all.py` — see [Consider tests/
   too](#consider-tests-too) above for when a change should add to or update
-  what's in there rather than just running it as-is.
-- **A new migration**: apply it (`SQLITE_PATH=/tmp/scratch.db make
-  db-migrate`) against a scratch database seeded from before it existed
-  (copy a pre-migration `app.db`, or just an empty file for a brand new
-  one), then check the column/table landed as expected. Worth rolling back
-  too if the migration is anything more than a straightforward additive
-  column/table — `rollback()` gets a lot less exercise than `migrate()` in
-  practice and is where a mistake tends to hide.
+  what's in there rather than just running it as-is. Needs a reachable
+  Postgres server with permission to CREATE DATABASE/DROP DATABASE — each
+  journey creates and drops its own throwaway database (see
+  tests/_harness.py).
+- **A new migration**: apply it (`PGDATABASE=scratch make db-migrate`)
+  against a scratch database seeded from before it existed (`pg_dump -F c
+  scalar | pg_restore -d scratch` for a copy of the real one, or just
+  `createdb scratch` for an empty one), then check the column/table landed
+  as expected. Worth rolling back too if the migration is anything more
+  than a straightforward additive column/table — `rollback()` gets a lot
+  less exercise than `migrate()` in practice and is where a mistake tends
+  to hide.
