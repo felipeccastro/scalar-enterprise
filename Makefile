@@ -16,7 +16,7 @@ WORKERS ?= 1
 BACKUP_DIR ?= backups
 TS := $(shell date +%Y%m%d-%H%M%S)
 
-.PHONY: run dist db-migrate backup repl
+.PHONY: run dist db-migrate backup repl test
 run:
 	gunicorn app:app \
 		--bind $(HOST):$(PORT) \
@@ -35,6 +35,11 @@ db-migrate:
 # Migrations are NOT applied here, same caveat as `make run` above.
 repl:
 	python3 repl.py
+
+# Every user-journey test in tests/, each in its own process against its own
+# throwaway Postgres database — see tests/_harness.py and tests/run_all.py.
+test:
+	python3 tests/run_all.py
 
 # Package a ready-to-run copy of this app for the landing page's
 # "Buy Once" button (../admin/routes/downloads.py serves the result) — the
