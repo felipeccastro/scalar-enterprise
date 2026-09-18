@@ -12,25 +12,25 @@ from __future__ import annotations
 
 import json
 
-from bottle import request
-
 from app import app, render
-from models import AuditLog
+from asgi import request
+from models import AuditLog, db
 from pages._shared import _subject_url
 
 PAGE_SIZE = 50
 
 
 @app.route("/audit", method="GET", name="audit_log")
-def audit_log():
+async def audit_log():
     page = request.query.get("page") or "1"
     page = int(page) if page.isdigit() and int(page) > 0 else 1
     query = AuditLog.select().order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-    total = query.count()
-    rows = list(query.paginate(page, PAGE_SIZE))
-    return render(
+    total = await db.count(query)
+    rows = await db.list(query.paginate(page, PAGE_SIZE))
+    entries = [await _present(e) for e in rows]
+    return await render(
         "audit_log.html",
-        entries=[_present(e) for e in rows],
+        entries=entries,
         page=page,
         has_prev=page > 1,
         has_next=page * PAGE_SIZE < total,
@@ -38,11 +38,15 @@ def audit_log():
     )
 
 
-def _present(entry: AuditLog) -> dict:
+async def _present(entry: AuditLog) -> dict:
     try:
         changes = json.loads(entry.changes_json or "{}")
     except (ValueError, TypeError):
         changes = {}
+    actor_name = "System"
+    if entry.actor_id:
+        actor = await entry.afetch(AuditLog.actor)
+        actor_name = actor.name
     return {
         "subject_type": entry.subject_type,
         "subject_id": entry.subject_id,
@@ -52,7 +56,7 @@ def _present(entry: AuditLog) -> dict:
         # there rather than this page having to know.
         "url": _subject_url(entry.subject_type, entry.subject_id),
         "action": entry.action,
-        "actor": entry.actor.name if entry.actor_id else "System",
+        "actor": actor_name,
         "created_at": entry.created_at,
         "changes": changes,
     }

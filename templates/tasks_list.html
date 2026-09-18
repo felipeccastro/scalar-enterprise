@@ -1,77 +1,80 @@
-%rebase('layout', title='Tasks' + (' — Deleted' if showing_deleted else ''), back_url=url_for('dashboard'))
+{% extends "layout.html" %}
+{% block title %}Tasks{{ ' — Deleted' if showing_deleted else '' }}{% endblock %}
+{% block back_url %}{{ url_for('dashboard') }}{% endblock %}
+{% block content %}
 <div class="page-header">
-  <h1>Tasks{{' — Deleted' if showing_deleted else ''}}</h1>
-  %if not showing_deleted:
+  <h1>Tasks{{ ' — Deleted' if showing_deleted else '' }}</h1>
+  {% if not showing_deleted %}
     <button type="button" class="btn btn-primary" commandfor="new-task-dialog" command="show-modal">+ New task</button>
-  %end
+  {% endif %}
 </div>
 
-<form method="get" action="{{url_for('tasks_list')}}" class="search-form">
-  %if showing_deleted:
+<form method="get" action="{{ url_for('tasks_list') }}" class="search-form">
+  {% if showing_deleted %}
     <input type="hidden" name="deleted" value="1">
-  %end
-  <input type="search" name="q" value="{{q}}" placeholder="Search tasks…">
+  {% endif %}
+  <input type="search" name="q" value="{{ q }}" placeholder="Search tasks…">
   <button class="btn" type="submit">Search</button>
-  %if q:
-    <a class="btn-link" href="{{url_for('tasks_list', _query={'deleted': '1'} if showing_deleted else {})}}">Clear</a>
-  %end
+  {% if q %}
+    <a class="btn-link" href="{{ url_for('tasks_list', _query={'deleted': '1'} if showing_deleted else {}) }}">Clear</a>
+  {% endif %}
   <span class="search-form-spacer"></span>
-  %if showing_deleted:
-    <a class="btn-link" href="{{url_for('tasks_list')}}">&larr; Back to tasks</a>
-  %else:
-    <a class="btn-link" href="{{url_for('tasks_list', _query={'deleted': '1'})}}">View deleted tasks</a>
-  %end
+  {% if showing_deleted %}
+    <a class="btn-link" href="{{ url_for('tasks_list') }}">&larr; Back to tasks</a>
+  {% else %}
+    <a class="btn-link" href="{{ url_for('tasks_list', _query={'deleted': '1'}) }}">View deleted tasks</a>
+  {% endif %}
 </form>
 
-%if showing_deleted:
+{% if showing_deleted %}
   <!-- A plain list, not the kanban board below — grouping deleted tasks by
        status is the wrong frame for "what did we soft-delete". -->
   <table class="data-table">
     <thead><tr><th>Title</th><th>Status</th><th></th></tr></thead>
     <tbody>
-      %for t in deleted_tasks:
+      {% for t in deleted_tasks %}
         <tr>
-          <td><a href="{{url_for('task_detail', task_id=t.id)}}">{{t.title}}</a></td>
-          <td><span class="badge badge-{{t.status}}"><i class="dot"></i>{{status_label(t.status)}}</span></td>
+          <td><a href="{{ url_for('task_detail', task_id=t.id) }}">{{ t.title }}</a></td>
+          <td><span class="badge badge-{{ t.status }}"><i class="dot"></i>{{ status_label(t.status) }}</span></td>
           <td>
-            <form method="post" action="{{url_for('task_restore', task_id=t.id)}}" class="inline-form">
-              <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+            <form method="post" action="{{ url_for('task_restore', task_id=t.id) }}" class="inline-form">
+              <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
               <button class="btn-link" type="submit">Restore</button>
             </form>
           </td>
         </tr>
-      %end
-      %if not deleted_tasks:
+      {% endfor %}
+      {% if not deleted_tasks %}
         <tr><td colspan="3" class="muted">No deleted tasks.</td></tr>
-      %end
+      {% endif %}
     </tbody>
   </table>
-%else:
+{% else %}
   <dialog id="new-task-dialog">
     <div class="dialog-head">
       <span class="dialog-title">New task</span>
       <button type="button" class="dialog-close" commandfor="new-task-dialog" command="close" aria-label="Close">✕</button>
     </div>
-    <form method="post" action="{{url_for('tasks_create')}}">
-      <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+    <form method="post" action="{{ url_for('tasks_create') }}">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
       <div class="dialog-body inline-form">
         <input type="text" name="title" placeholder="Title" required autofocus>
         <select name="client_id">
           <option value="">No client</option>
-          %for c in clients:
-            <option value="{{c.id}}">{{c.name}}</option>
-          %end
+          {% for c in clients %}
+            <option value="{{ c.id }}">{{ c.name }}</option>
+          {% endfor %}
         </select>
         <select name="assignee_id">
           <option value="">Unassigned</option>
-          %for u in team_users:
-            <option value="{{u.id}}">{{u.name}}</option>
-          %end
+          {% for u in team_users %}
+            <option value="{{ u.id }}">{{ u.name }}</option>
+          {% endfor %}
         </select>
         <select name="status">
-          %for s in statuses:
-            <option value="{{s}}">{{status_label(s)}}</option>
-          %end
+          {% for s in statuses %}
+            <option value="{{ s }}">{{ status_label(s) }}</option>
+          {% endfor %}
         </select>
         <textarea name="description" placeholder="Description"></textarea>
       </div>
@@ -83,29 +86,29 @@
   </dialog>
 
   <div class="kanban">
-    %for s in statuses:
+    {% for s in statuses %}
       <div class="kanban-col">
-        <h3><span class="status-dot status-dot-{{s}}"></span>{{status_label(s)}} <span class="badge">{{len(grouped[s])}}</span></h3>
-        <div class="kanban-col-body" data-status="{{s}}">
-          %for t in grouped[s]:
-            <div class="kanban-card kanban-card-{{s}}" draggable="true" data-task-id="{{t.id}}">
+        <h3><span class="status-dot status-dot-{{ s }}"></span>{{ status_label(s) }} <span class="badge">{{ grouped[s] | length }}</span></h3>
+        <div class="kanban-col-body" data-status="{{ s }}">
+          {% for t in grouped[s] %}
+            <div class="kanban-card kanban-card-{{ s }}" draggable="true" data-task-id="{{ t.id }}">
               <!-- draggable="false": links are natively draggable in most
                    browsers, which would otherwise steal the drag gesture
                    (as a URL drag) from the card div above it. -->
-              <a class="kanban-card-link" draggable="false" href="{{url_for('task_detail', task_id=t.id)}}">
-                <div class="kanban-card-title">{{t.title}}</div>
-                %if t.client_id:
-                  <div class="kanban-card-meta">{{t.client.name}}</div>
-                %end
-                %if t.assignee_id:
-                  <div class="kanban-card-meta">{{t.assignee.name}}</div>
-                %end
+              <a class="kanban-card-link" draggable="false" href="{{ url_for('task_detail', task_id=t.id) }}">
+                <div class="kanban-card-title">{{ t.title }}</div>
+                {% if t.client_id %}
+                  <div class="kanban-card-meta">{{ t.client.name }}</div>
+                {% endif %}
+                {% if t.assignee_id %}
+                  <div class="kanban-card-meta">{{ t.assignee.name }}</div>
+                {% endif %}
               </a>
             </div>
-          %end
+          {% endfor %}
         </div>
       </div>
-    %end
+    {% endfor %}
   </div>
 
   <!-- Drag a card onto another column to change its status. Plain HTML5
@@ -153,11 +156,11 @@
             const badge = c.closest('.kanban-col').querySelector('.badge');
             if (badge) badge.textContent = c.children.length;
           });
-          fetch('{{url_for("tasks_reorder")}}', {
+          fetch('{{ url_for("tasks_reorder") }}', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/x-www-form-urlencoded',
-              'X-CSRF-Token': '{{csrf_token()}}',
+              'X-CSRF-Token': '{{ csrf_token() }}',
             },
             body: new URLSearchParams([['status', status], ...ids.map((id) => ['task_id', id])]),
           }).then((r) => { if (!r.ok) location.reload(); }).catch(() => location.reload());
@@ -165,4 +168,5 @@
       });
     })();
   </script>
-%end
+{% endif %}
+{% endblock %}

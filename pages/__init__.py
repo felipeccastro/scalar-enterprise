@@ -9,9 +9,8 @@ file per feature instead of one file per app.
 
 from __future__ import annotations
 
-from bottle import HTTPError, request
-
 from app import app
+from asgi import request
 from utils import (
     PUBLIC_ROUTES,
     SESSION_INDEPENDENT_PATHS,
@@ -23,20 +22,22 @@ from utils import (
 
 
 @app.hook("before_request")
-def _bootstrap_redirect() -> None:
+async def _bootstrap_redirect() -> None:
     """Until the first owner account exists, every road leads to /register.
 
     /health is exempt too: a freshly provisioned, team-less instance should
     still report whether its database is reachable, not bounce a health
-    check into a 200-but-meaningless /register redirect."""
-    if request.path in ("/register", "/health") or request.path.startswith("/static/"):
+    check into a 200-but-meaningless /register redirect. /static/ never
+    reaches a before_request hook at all — it's served by a Starlette Mount
+    (see app.py), not a route these hooks apply to."""
+    if request.path in ("/register", "/health"):
         return
-    if not any_team_members_exist():
+    if not await any_team_members_exist():
         redirect(url_for("register_owner"))
 
 
 @app.hook("before_request")
-def _require_login_hook() -> None:
+async def _require_login_hook() -> None:
     """Every route requires a logged-in user by default — the opposite of a
     per-route @require_login decorator, which is easy to forget on a new
     route and silently leave unprotected. PUBLIC_ROUTES (utils.py) lists
@@ -45,25 +46,21 @@ def _require_login_hook() -> None:
     else redirects to /login.
 
     Registered *after* _bootstrap_redirect above — before_request hooks run
-    in registration order (see Bottle's add_hook) — so a fresh, team-less
+    in registration order (see asgi.py's App.route) — so a fresh, team-less
     instance always lands on /register first, before this hook gets a
     chance to bounce it to /login instead.
 
-    Resolves the route itself via app.match() rather than checking
-    request.route: before_request hooks fire *before* Bottle's own routing
-    (see utils.py's SESSION_INDEPENDENT_PATHS comment), so there's no route
-    to inspect yet at this point otherwise. match() is a plain, read-only
-    lookup (see Router.match) — cheap to do twice per request.
-    """
-    if request.path.startswith("/static/") or request.path in SESSION_INDEPENDENT_PATHS:
+    request.route_name is the name= of whichever route is about to run,
+    set by asgi.py's App.route before any before_request hook runs — unlike
+    Bottle, where before_request hooks fire *before* routing (hence
+    SESSION_INDEPENDENT_PATHS being path-keyed rather than route-name-keyed
+    below: that one's still checked ahead of a route even existing, since
+    it's really about auth strategy, not this app's own routing)."""
+    if request.path in SESSION_INDEPENDENT_PATHS:
         return
-    try:
-        route, _ = app.match(request.environ)
-    except HTTPError:
-        return  # a 404/405 — let Bottle's own routing surface that normally
-    if route.name in PUBLIC_ROUTES:
+    if request.route_name in PUBLIC_ROUTES:
         return
-    if current_user() is None:
+    if await current_user() is None:
         redirect(url_for("login"))
 
 

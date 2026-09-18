@@ -1,18 +1,24 @@
-"""Bottle app factory/bootstrap.
+"""Starlette app factory/bootstrap.
 
 Single-tenant template app — no workspace/multi-tenancy concept anywhere.
-One real pip dependency, psycopg2 (the Postgres driver — see models.py and
-requirements.txt); the session, CSRF, password hashing, mailer, and Ask-AI
-HTTP calls are all hand-rolled or stdlib (see utils.py / ai.py).
+Real pip dependencies now (starlette, uvicorn, jinja2, peewee, asyncpg,
+greenlet — see requirements.txt and AGENTS.md); the session, CSRF, password
+hashing, mailer, and Ask-AI HTTP calls are all still hand-rolled or stdlib
+(see utils.py / ai.py). asgi.py is the Bottle-shaped compatibility layer
+over Starlette that the rest of this app (this file included) is written
+against — see its own docstring for why it exists and how it's put
+together.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import sys
 import time
+import traceback
 from logging.handlers import RotatingFileHandler
 
 # Every module in pages/ does `from app import app` so every route can be
@@ -20,24 +26,20 @@ from logging.handlers import RotatingFileHandler
 # file is ever launched directly (`python3 app.py`), Python runs it as
 # `__main__` — and that `from app import app` would otherwise import a
 # *second*, separate copy of this module under the name "app", with its
-# own fresh Bottle() instance that never sees any of pages/'s routes (the
-# one actually passed to run() below would then only have the routes
+# own fresh App() instance that never sees any of pages/'s routes (the one
+# actually passed to uvicorn below would then only have the routes
 # registered above this point). Aliasing "app" to the already-running
 # module up front makes the later self-import a no-op lookup instead of a
 # second execution.
 sys.modules.setdefault("app", sys.modules[__name__])
 
-# peewee and bottle are vendored in vendor/ as plain .py files, not
-# pip-installed — this app runs with `python3 app.py` and nothing else, no
-# venv/pip step required. Both are MIT-licensed; see vendor/LICENSE.peewee
-# and vendor/LICENSE.bottle. peewee-migrate and the slice of playhouse it
-# needs (for migrations/ — see models.py: run_migrations()) are vendored
-# the same way; see vendor/LICENSE.peewee-migrate.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from starlette.exceptions import HTTPException
+from starlette.responses import FileResponse
+from starlette.staticfiles import StaticFiles
 
-from bottle import Bottle, HTTPError, debug as _bottle_debug, request, response, run, static_file, template
-
-from models import db, init_database, run_migrations, status_label
+from asgi import App, Redirect, request, response
+from models import db, init_database, make_database, run_migrations, status_label
 from utils import (
     csrf_token,
     current_user,
@@ -106,55 +108,68 @@ def _configure_logging() -> None:
 _configure_logging()
 logger = logging.getLogger(__name__)
 
-# Binds the db proxy to a concrete connection — cheap, and distinct from
-# actually *applying* migrations (run_migrations(), right below). Needed
-# here, unconditionally, before jobs.start() further down: its background
-# thread reaches for `db` the moment it's running, gunicorn worker or dev
-# server alike, and a bound connection is exactly what that needs even on
-# a schema-less brand new database — the alternative is jobs.py crashing on
-# an uninitialized proxy on every process boot that isn't `python3 app.py`.
+# Binds the db proxy to a concrete connection object — cheap (just building
+# the AsyncPostgresqlDatabase instance, no actual connection yet) and
+# distinct from actually *applying* migrations (run_migrations(), right
+# below). Needed here, unconditionally, before jobs.start() further down:
+# its background loop reaches for `db` the moment it's running, uvicorn
+# worker or dev server alike, and a bound proxy is exactly what that needs
+# even on a schema-less brand new database — the alternative is jobs.py
+# crashing on an uninitialized proxy on every process boot that isn't
+# `python3 app.py`.
 init_database()
 
 if __name__ == "__main__":
     # Only the direct-run dev path auto-migrates, and it does so this
-    # early — before jobs.start() below, not down by run() at the bottom of
-    # this file — so that background thread never polls a table a pending
-    # migration hasn't created yet. `gunicorn app:app` (see Makefile)
+    # early — before jobs.start() below, not down by uvicorn.run() at the
+    # bottom of this file — so that background loop never polls a table a
+    # pending migration hasn't created yet. `uvicorn app:app` (see Makefile)
     # imports this module without __name__ ever equaling "__main__", so a
     # production/self-hosted deploy applies migrations as its own explicit
     # step first — `make db-migrate` — same split as admin/. Auto-migrating
-    # on every gunicorn worker's own import would mean concurrent workers
+    # on every uvicorn worker's own import would mean concurrent workers
     # racing to apply the same pending migration; a single, singular step
     # ahead of starting any of them avoids that outright.
-    run_migrations()
+    #
+    # asyncio.run() here (not a bare coroutine) because there's no event
+    # loop yet at import time — this runs its own, start to finish, before
+    # uvicorn.run() starts the one that actually serves requests. That
+    # loop is temporary and gets torn down the moment this call returns —
+    # but db.obj's asyncpg connection pool (see models.py) gets lazily
+    # created on whatever loop first uses it, i.e. *this* one, and using a
+    # pool from a different loop than the one that created it raises. Drop
+    # it and rebuild a fresh (still unconnected, so still cheap) instance
+    # so the pool that actually gets used gets created fresh, on whichever
+    # loop uvicorn.run() below ends up running.
+    asyncio.run(run_migrations())
+    db.initialize(make_database())
 
-# Started here, not just under `if __name__ == '__main__'`, so the
-# reminder-firing job (see jobs.py) also runs under `gunicorn app:app`.
-# jobs.start() is idempotent and the thread is a daemon, so this is safe
-# however many times/entrypoints import this module.
 import jobs  # noqa: E402
 
-jobs.start()
-
 DEBUG = os.environ.get("DEBUG", "1") == "1"
-# Set at module level (not just under `if __name__ == '__main__'`) so it
-# also applies under `gunicorn app:app` — gunicorn's own --reload only
-# re-execs the worker on *.py changes, but bottle's template() cache
-# (app.py's render() -> bottle.template()) only skips its cache and
-# re-reads a template file from disk when bottle.DEBUG is set, regardless of
-# which process is serving requests. Without this, a template edit needs a
-# full worker restart to show up even with --reload running.
-_bottle_debug(DEBUG)
 
-app = Bottle()
+app = App()
 
-# bottle's SimpleTemplate looks in this list for template files (.html, per
-# BaseTemplate's extensions list — no .tpl in this app). Also make our
-# own url_for/csrf_token/current_user/flash helpers available to every
-# template without each render() call having to pass them explicitly.
-import bottle as _bottle_module  # noqa: E402
+# Registered here, not just under `if __name__ == '__main__'`, so the
+# reminder-firing job (see jobs.py) also runs under `uvicorn app:app`. Runs
+# on ASGI startup (once the event loop is actually running), not at import
+# time — jobs.start() schedules a task on *this* loop, the same one that
+# will serve every request, which is what playhouse.pwasyncio's connection
+# pool (see models.py) needs. jobs.start() is idempotent, so this is safe
+# however many times/entrypoints import this module.
+app.on_startup(jobs.start)
+app.on_shutdown(jobs.stop)
 
-_bottle_module.TEMPLATE_PATH.insert(0, os.path.join(BASE_DIR, "templates"))
+# Jinja2 templates, autoescape on for .html (matches Bottle's own
+# default-escaped {{ }} — an explicit `| safe` opts a value out, same shape
+# as Bottle's {{! }}). auto_reload=DEBUG re-reads a template file from disk
+# when it changes instead of using Jinja2's compiled-template cache, the
+# same role bottle.DEBUG played for its own template() cache.
+_jinja_env = Environment(
+    loader=FileSystemLoader(os.path.join(BASE_DIR, "templates")),
+    autoescape=select_autoescape(["html"]),
+    auto_reload=DEBUG,
+)
 
 
 def asset_version(filepath: str) -> int:
@@ -183,9 +198,10 @@ def js_string(value: str) -> str:
     )
 
 
+# DB-free — safe to call live from inside a template, unlike current_user()
+# (see render() below, which resolves that one eagerly instead).
 _TEMPLATE_DEFAULTS = {
     "url_for": url_for,
-    "current_user": current_user,
     "csrf_token": csrf_token,
     "get_flashed_messages": get_flashed_messages,
     "asset_version": asset_version,
@@ -201,10 +217,16 @@ _TEMPLATE_DEFAULTS = {
 }
 
 
-def render(name: str, **kwargs) -> str:
+async def render(name: str, **kwargs) -> str:
+    """current_user() touches the database (see utils.py) and is awaited
+    here, once, up front — Jinja2 templates can't `await` mid-render, so
+    layout.html (the only template that needs it) gets it as a plain value
+    in the context instead of calling it live the way every other
+    DB-free template global above is."""
     ctx = dict(_TEMPLATE_DEFAULTS)
+    ctx["current_user"] = await current_user()
     ctx.update(kwargs)
-    return template(name, **ctx)
+    return _jinja_env.get_template(name).render(**ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -213,70 +235,95 @@ def render(name: str, **kwargs) -> str:
 
 
 @app.hook("before_request")
-def _start_request_timer() -> None:
-    # Stashed on environ (request-local by construction — bottle builds a
-    # fresh Request per WSGI call) rather than a module global, so concurrent
-    # requests under WORKERS>1/threads can't clobber each other's start time.
+async def _start_request_timer() -> None:
+    # Stashed on request.environ (request-local by construction — see
+    # asgi.py's _Ctx, one per request/task) rather than a module global, so
+    # concurrent requests can't clobber each other's start time.
     request.environ["scalar.start_time"] = time.monotonic()
 
 
 @app.hook("before_request")
-def _open_db() -> None:
-    db.connect(reuse_if_open=True)
-    # Every write a POST makes should land together: if a handler creates
-    # several rows and a later one fails, the earlier ones shouldn't survive
-    # as an orphaned partial write. GETs don't get one — they're read-only,
-    # and holding a transaction open for a whole page render buys nothing.
-    if request.method == "POST":
-        db.session_start()
+async def _open_db() -> None:
+    await db.aconnect()
+    # Every write a POST/PUT/PATCH/DELETE makes should land together: if a
+    # handler creates several rows and a later one fails, the earlier ones
+    # shouldn't survive as an orphaned partial write. GETs don't get one —
+    # they're read-only, and holding a transaction open for a whole page
+    # render buys nothing. The transaction object itself is stashed on
+    # request.environ so _close_db (an after_request hook, run separately —
+    # see this module's own async_atomic usage) can commit/roll it back.
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        # db.atomic() (not db.obj.atomic()) would go through DatabaseProxy's
+        # own hardcoded atomic()/transaction()/savepoint()/manual_commit()
+        # methods, which always build plain peewee._atomic — unlike every
+        # other method here, these four are NOT proxied through to
+        # db.obj's own (async-aware, for AsyncPostgresqlDatabase) versions
+        # via Proxy.__getattr__, since DatabaseProxy defines its own.
+        txn = db.obj.atomic()
+        await txn.__aenter__()
+        request.environ["_txn"] = txn
 
 
 @app.hook("before_request")
-def _open_session_hook() -> None:
+async def _open_session_hook() -> None:
     open_session()
 
 
 @app.hook("after_request")
-def _save_session_hook() -> None:
+async def _save_session_hook() -> None:
     save_session()
 
 
+def _propagating_error() -> BaseException | None:
+    """The exception currently unwinding through this after_request hook,
+    *unless* it's a controlled jump (redirect()/abort() — see utils.py)
+    rather than a genuine failure. Unlike Bottle, where HTTPResponse is
+    caught by the framework's own routing before after-hooks ever see it
+    (clearing sys.exc_info() by the time they run), asgi.py's App.route
+    runs after_request hooks from a bare `finally` — sys.exc_info() still
+    reports a Redirect/HTTPException here exactly as it would a real bug,
+    so this excludes them explicitly instead of relying on it alone."""
+    exc = sys.exc_info()[1]
+    if isinstance(exc, (Redirect, HTTPException)):
+        return None
+    return exc
+
+
 @app.hook("after_request")
-def _close_db() -> None:
+async def _close_db() -> None:
     """Resolve this request's transaction (see _open_db above), then close
     the connection.
 
     after_request runs unconditionally — after a normal response, after an
-    abort()/redirect() (both just raise HTTPResponse, a controlled jump, not
-    a failure), and after a genuine unhandled exception alike: Bottle's
-    _handle() fires this hook from a `finally`, before the exception is
-    turned into a 500 by the outer handler. Only that last case should roll
-    back rather than commit, and it's the one Python guarantees
-    sys.exc_info() still reports here — a caught-and-suppressed HTTPResponse
-    has already cleared it by the time its own `finally` runs, verified
-    against this exact try/except/finally shape."""
-    if db.in_transaction():
-        if sys.exc_info()[0] is not None:
-            db.session_rollback()
-        else:
-            db.session_commit()
+    abort()/redirect() (both just raise, a controlled jump — see
+    _propagating_error above), and after a genuine unhandled exception
+    alike. Only that last case should roll back rather than commit: every
+    route in this app that writes something then redirects (which is most
+    of them) would otherwise have that write silently rolled back by its
+    own redirect()."""
+    txn = request.environ.get("_txn")
+    if txn is not None:
+        error = _propagating_error()
+        exc_info = (type(error), error, error.__traceback__) if error is not None else (None, None, None)
+        await txn.__aexit__(*exc_info)
     if not db.is_closed():
-        db.close()
+        await db.aclose()
 
 
 @app.hook("after_request")
-def _log_request() -> None:
+async def _log_request() -> None:
     """Access log: one line per request, e.g. `GET /clients -> 200 (4.2ms)`.
     Runs from the same finally as _close_db above (see its comment), so for
     a genuine unhandled exception response.status_code is still whatever it
-    was before the request started — bottle only applies the 500 status
-    afterwards, in the outer handler that turns the exception into one (see
-    _server_error, which logs that case's full traceback separately). The
-    same sys.exc_info() check _close_db relies on tells us that's what's
-    coming, so use 500 instead of trusting response.status_code blindly."""
+    was before the request started — the actual error status only gets
+    applied to the real outgoing response afterwards, by asgi.py's error
+    handlers. The same _propagating_error() check _close_db relies on tells
+    us that's what's coming, so use 500 instead of trusting response.status
+    blindly (redirect()/abort() report their own real status normally,
+    same as any other response)."""
     start = request.environ.get("scalar.start_time")
     elapsed_ms = (time.monotonic() - start) * 1000 if start is not None else 0.0
-    status = 500 if sys.exc_info()[0] is not None else response.status_code
+    status = 500 if _propagating_error() is not None else response.status
     logger.info("%s %s -> %s (%.1fms)", request.method, request.path, status, elapsed_ms)
 
 
@@ -286,7 +333,7 @@ def _log_request() -> None:
 
 
 @app.route("/health", name="health")
-def _health():
+async def _health():
     """Liveness/readiness probe for whatever's watching this process (a
     process manager, a load balancer, admin's launcher — see
     admin/launcher/provisioner.py's own _health_check, which currently just
@@ -305,7 +352,7 @@ def _health():
     still catches a connection failure even on a schema that somehow never
     finished migrating."""
     try:
-        db.execute_sql("SELECT 1")
+        await db.aexecute_sql("SELECT 1")
     except Exception as e:
         response.status = 503
         return {"status": "error", "detail": str(e)}
@@ -316,10 +363,7 @@ def _health():
 # Static files
 # ---------------------------------------------------------------------------
 
-
-@app.route("/static/<filepath:path>", name="static")
-def _static(filepath: str):
-    return static_file(filepath, root=os.path.join(BASE_DIR, "static"))
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
 
 # ---------------------------------------------------------------------------
@@ -328,52 +372,52 @@ def _static(filepath: str):
 
 
 @app.error(400)
-def _bad_request(error: HTTPError):
+async def _bad_request(error: HTTPException):
     # abort(400, "...") call sites (CSRF check, invalid status, etc.) pass a
     # specific, user-actionable message as the body — show that instead of
     # a generic one whenever it's there.
-    return render("error.html", code=400, heading="Something's not right with that request",
-                  message=error.body or "The request couldn't be processed. Please try again.")
+    return await render("error.html", code=400, heading="Something's not right with that request",
+                         message=error.detail or "The request couldn't be processed. Please try again.")
 
 
 @app.error(404)
-def _not_found(_error: HTTPError):
-    return render("error.html", code=404, heading="Not found",
-                  message="That page doesn't exist, or was moved.")
+async def _not_found(_error: HTTPException):
+    return await render("error.html", code=404, heading="Not found",
+                         message="That page doesn't exist, or was moved.")
 
 
 @app.error(403)
-def _forbidden(_error: HTTPError):
-    return render("error.html", code=403, heading="You don't have access",
-                  message="You're signed in, but you don't have permission to view this.")
+async def _forbidden(_error: HTTPException):
+    return await render("error.html", code=403, heading="You don't have access",
+                         message="You're signed in, but you don't have permission to view this.")
 
 
 @app.error(500)
-def _server_error(_error: HTTPError):
-    # By the time bottle's error_handler dispatch reaches this callback, the
-    # exception has already unwound out of the except block that caught it
-    # (see bottle.py: Bottle._handle) — sys.exc_info() is empty here, so
-    # logger.exception() would log nothing useful. Bottle stashes the
-    # original exception/traceback string on the HTTPError itself instead
-    # (`_error.exception`/`_error.traceback`); use those. Only unhandled
-    # exceptions carry them — an explicit `abort(500, "msg")` call site has
-    # neither, hence the fallback.
-    if _error.traceback:
-        logger.error("Unhandled exception on %s %s\n%s", request.method, request.path, _error.traceback)
-    else:
-        logger.error("500 on %s %s: %s", request.method, request.path, _error.body)
-    # A 500 can mean the request died mid-transaction; roll back before any
-    # further query runs (the error page itself queries current_user/nav
-    # data), and guard the render so a broken template can't cascade into a
-    # second crash.
+async def _server_error(error: Exception):
+    # Starlette's ServerErrorMiddleware hands us the raw exception here
+    # (not an HTTPException wrapper the way Bottle's HTTPError was) —
+    # format the traceback ourselves for the log line.
+    tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    logger.error("Unhandled exception on %s %s\n%s", request.method, request.path, tb)
+    # A 500 can mean the request died mid-transaction — a defensive second
+    # cleanup attempt, in case _close_db (an after_request hook, which
+    # already ran once by the time this handler fires) didn't fully
+    # complete itself (e.g. it's what raised). db.in_transaction() and
+    # is_closed() are both plain local-state checks, safe to call without
+    # the greenlet bridge queries otherwise need. Guarded so a broken
+    # render() below can't cascade into a second crash.
     try:
+        if db.in_transaction():
+            txn = request.environ.get("_txn")
+            if txn is not None:
+                await txn.__aexit__(*sys.exc_info())
         if not db.is_closed():
-            db.rollback()
+            await db.aclose()
     except Exception:
         pass
     try:
-        return render("error.html", code=500, heading="Something went wrong",
-                      message="An unexpected error occurred. Please try again.")
+        return await render("error.html", code=500, heading="Something went wrong",
+                             message="An unexpected error occurred. Please try again.")
     except Exception:
         return (
             "<!doctype html><meta charset=utf-8><title>500</title>"
@@ -390,15 +434,17 @@ import pages  # noqa: E402,F401
 
 
 if __name__ == "__main__":
+    import uvicorn
+
     # Migrations are already applied by now — see the earlier
-    # `if __name__ == "__main__": run_migrations()` right after
-    # init_database(), well before jobs.start(). This is the same
+    # `if __name__ == "__main__": asyncio.run(run_migrations())` right
+    # after init_database(), well before jobs.start(). This is the same
     # `__main__` condition evaluated a second time, not a second migration
-    # step; the block's just placed where run() naturally belongs.
-    run(
+    # step; the block's just placed where uvicorn.run() naturally belongs.
+    uvicorn.run(
         app,
         host=os.environ.get("HOST", "0.0.0.0"),
         port=int(os.environ.get("PORT", 5000)),
-        debug=DEBUG,
-        reloader=DEBUG,
+        reload=False,  # `make run` (uvicorn's own --reload, see Makefile) is the autoreload path, not this
+        log_config=None,  # this app configures logging itself (see _configure_logging above)
     )

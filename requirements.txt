@@ -1,9 +1,29 @@
-# peewee and bottle are still vendored as plain .py files in vendor/ — see
-# vendor/LICENSE.peewee and vendor/LICENSE.bottle (both MIT) — but this tier
-# runs against Postgres (see models.py), which needs a real driver:
-#   pip install -r requirements.txt
+# pip install -r requirements.txt
 #
-# `make` (see Makefile) runs the app under gunicorn instead of `python3
-# app.py`, for autoreload + a periodic worker restart — install that too:
-#   pip install gunicorn
-psycopg2-binary
+# Nothing is vendored anymore (see AGENTS.md — enterprise dropped that
+# convention once Postgres/asyncpg made a real pip dependency unavoidable
+# anyway). starlette/uvicorn are the ASGI framework + server; jinja2 is the
+# template engine; python-multipart is what starlette needs to parse
+# form/file uploads.
+starlette
+uvicorn[standard]
+jinja2
+python-multipart
+
+# peewee, pinned to the first version shipping real asyncio support
+# (playhouse.pwasyncio, asyncpg-backed — see models.py). peewee-migrate is
+# pinned to the first release compatible with peewee 4.x.
+peewee==4.4.0
+peewee-migrate==2.3.0
+
+# What playhouse.pwasyncio itself runs on: asyncpg is the async Postgres
+# driver, greenlet is the sync/async bridge behind Model.aget()/.asave()/
+# query.aexecute() — the same mechanism SQLAlchemy's own async ORM uses.
+asyncpg
+greenlet
+
+# `make` (see Makefile) runs the app under uvicorn's own --reload, already
+# included above — nothing further to install for dev.
+
+# `make test` (see tests/run_all.py) runs each journey under pytest.
+pytest

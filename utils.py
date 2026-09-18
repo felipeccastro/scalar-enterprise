@@ -1,15 +1,17 @@
 """Session/CSRF, auth helpers, mailer, activity/notification recording, slugify.
 
-Hand-rolled throughout — the zero-pip-dependency constraint (peewee + bottle
-only) rules out Flask-style session cookies, werkzeug password hashing, and
-any HTTP client library for outbound mail/API calls.
+Hand-rolled throughout — Flask-style session cookies and werkzeug password
+hashing aren't worth a pip dependency for this app's needs, so both stay
+hand-rolled even though enterprise otherwise carries real dependencies now
+(starlette, peewee, asyncpg — see requirements.txt).
 
 Session model: the whole session is a small JSON object, HMAC-signed and
 base64-encoded into a single cookie (the same shape Flask's own signed-cookie
 session uses, minus Flask — no server-side session store/table). A request's
 session dict lives in `request.environ` for the duration of that request;
-`open_session`/`save_session` (wired up as Bottle hooks in app.py) decode it
-from the incoming cookie and re-encode it onto the outgoing response.
+`open_session`/`save_session` (wired up as before/after_request hooks in
+app.py) decode it from the incoming cookie and re-encode it onto the
+outgoing response.
 """
 
 from __future__ import annotations
@@ -22,14 +24,15 @@ import json
 import os
 import re
 import secrets
+import shutil
 import ssl
 import urllib.error
 import urllib.request
 from typing import Any, Callable
 
-from bottle import HTTPError, request, response
-from bottle import abort as _bottle_abort
-from bottle import redirect as _bottle_redirect
+from starlette.exceptions import HTTPException
+
+from asgi import Redirect, request, response
 
 # ---------------------------------------------------------------------------
 # Session (hand-rolled, hmac-signed cookie — no session table, no werkzeug)
@@ -108,29 +111,34 @@ def save_session() -> None:
 
 
 def redirect(url: str, code: int | None = None) -> None:
-    """Wraps bottle.redirect so a session cookie set during this request
-    (e.g. login, flash()) survives.
-
-    Bottle's redirect()/abort() raise an HTTPResponse that short-circuits
-    the rest of _handle() — and when that response is eventually cast to
-    WSGI output, Bottle re-applies THAT object's (pre-hook) headers/cookies
-    onto the ambient `response` a second time, which clobbers anything an
-    after_request hook added in between. Saving the session into `response`
-    right before redirect() builds its copy of the current response is what
-    makes the cookie survive that second apply.
-    """
+    """Raises asgi.Redirect, caught by the exception handler asgi.App wires
+    up. Saves the session first, same reasoning Bottle's own redirect()
+    wrapper gave: a cookie set during this request (e.g. login, flash())
+    needs to be staged onto the ambient `response` before the redirect
+    response is actually built, or it wouldn't make it onto the response
+    that goes out."""
     save_session()
-    _bottle_redirect(url, code)
+    raise Redirect(url, code or 302)
 
 
 def abort(code: int = 500, text: str = "Unknown Error.") -> None:
-    """Wraps bottle.abort — same reasoning as redirect() above, except
-    HTTPError starts from a blank response (it doesn't copy the current one
-    the way redirect() does), so the cookie has to be attached explicitly."""
+    """Raises starlette's own HTTPException — same reasoning as redirect()
+    above for saving the session first."""
     save_session()
-    err = HTTPError(code, text)
-    err._cookies = response._cookies
-    raise err
+    raise HTTPException(status_code=code, detail=text)
+
+
+def save_upload(upload: Any, path: str) -> None:
+    """Write a Starlette UploadFile to `path` — the one place Bottle's
+    FileUpload.save(path) doesn't have a direct Starlette equivalent (see
+    pages/attachments.py). Safe to call synchronously: by the time an
+    UploadFile reaches a handler, ASGIMiddleware (see asgi.py) has already
+    awaited the full multipart parse, so `.file` is a plain, already-fully-
+    buffered file-like object (SpooledTemporaryFile) — no further await
+    needed to read it."""
+    upload.file.seek(0)
+    with open(path, "wb") as f:
+        shutil.copyfileobj(upload.file, f)
 
 
 # ---------------------------------------------------------------------------
@@ -169,12 +177,12 @@ def require_internal_secret(view: Callable) -> Callable:
     through this app's own chat tools — see pages/chat.py's /internal/ai-command."""
 
     @functools.wraps(view)
-    def wrapper(*args: Any, **kwargs: Any):
+    async def wrapper(*args: Any, **kwargs: Any):
         expected = os.environ.get("SECRET_KEY", "")
         supplied = request.headers.get("X-Internal-Secret") or ""
         if not expected or not hmac.compare_digest(expected, supplied):
             abort(403, "Not authorized.")
-        return view(*args, **kwargs)
+        return await view(*args, **kwargs)
 
     return wrapper
 
@@ -224,33 +232,54 @@ def logout_user() -> None:
     get_session().clear()
 
 
-def current_user():
-    """Cached per-request so repeated calls don't re-hit the DB."""
+_CURRENT_USER_CACHE_KEY = "_current_user_cache"
+
+
+async def current_user():
+    """Cached per-request so repeated calls don't re-hit the DB. Async: this
+    touches the database (User.aget_by_id), unlike every other ambient
+    helper in this module — see app.py's render(), which resolves this once
+    and passes it into templates as a plain value rather than exposing this
+    function itself as a template global (Jinja2 can't await mid-render)."""
     from models import User
 
-    cache_key = "_current_user_cache"
     sess_env = request.environ
-    if cache_key in sess_env:
-        return sess_env[cache_key]
+    if _CURRENT_USER_CACHE_KEY in sess_env:
+        return sess_env[_CURRENT_USER_CACHE_KEY]
     uid = get_session().get("user_id")
     user = None
     if uid is not None:
         try:
-            user = User.get_by_id(uid)
+            user = await User.aget_by_id(uid)
         except User.DoesNotExist:
             user = None
-    sess_env[cache_key] = user
+    sess_env[_CURRENT_USER_CACHE_KEY] = user
     return user
 
 
-def team_member(user=None):
+def cached_user_id() -> int | None:
+    """The current request's user id, *without* ever touching the
+    database — only usable once current_user() has already resolved this
+    request (true by the time any handler reaches a model write; see
+    pages/__init__.py's login-required hook, which runs before anything
+    else). Used by models.py's audit-trail hook (_audit_actor_id): that
+    runs from inside a plain sync save()/delete_instance(), itself only
+    ever invoked through the asave()/adelete_instance() greenlet bridge —
+    doing a *fresh* async query from in there would need a second, nested
+    bridge for no real benefit, when the id request-scoped current_user()
+    already resolved is sitting right here."""
+    user = request.environ.get(_CURRENT_USER_CACHE_KEY)
+    return user.id if user else None
+
+
+async def team_member(user=None):
     from models import TeamMember
 
-    user = user or current_user()
+    user = user or await current_user()
     if user is None:
         return None
     try:
-        return TeamMember.get(TeamMember.user == user)
+        return await TeamMember.aget(TeamMember.user == user)
     except TeamMember.DoesNotExist:
         return None
 
@@ -286,23 +315,23 @@ def require_role(minimum_role: str) -> Callable[[Callable], Callable]:
 
     def decorator(view: Callable) -> Callable:
         @functools.wraps(view)
-        def wrapper(*args: Any, **kwargs: Any):
-            if current_user() is None:
+        async def wrapper(*args: Any, **kwargs: Any):
+            if await current_user() is None:
                 redirect(url_for("login"))
-            member = team_member()
+            member = await team_member()
             if member is None or not role_at_least(member.role, minimum_role):
                 abort(403, "You don't have access to that.")
-            return view(*args, **kwargs)
+            return await view(*args, **kwargs)
 
         return wrapper
 
     return decorator
 
 
-def any_team_members_exist() -> bool:
-    from models import TeamMember
+async def any_team_members_exist() -> bool:
+    from models import TeamMember, db
 
-    return TeamMember.select().limit(1).count() > 0
+    return await db.count(TeamMember.select().limit(1)) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -539,10 +568,10 @@ def _esc(s: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def record_activity(subject_type: str, subject_id: int, actor, verb: str, **payload: Any) -> None:
+async def record_activity(subject_type: str, subject_id: int, actor, verb: str, **payload: Any) -> None:
     from models import Activity
 
-    Activity.create(
+    await Activity.acreate(
         subject_type=subject_type,
         subject_id=subject_id,
         actor=actor,
@@ -551,12 +580,12 @@ def record_activity(subject_type: str, subject_id: int, actor, verb: str, **payl
     )
 
 
-def notify(user, kind: str, **payload: Any):
+async def notify(user, kind: str, **payload: Any):
     from models import Notification
 
     if user is None:
         return None
-    return Notification.create(user=user, kind=kind, payload_json=json.dumps(payload, default=str))
+    return await Notification.acreate(user=user, kind=kind, payload_json=json.dumps(payload, default=str))
 
 
 def notification_summary(n) -> str:

@@ -4,32 +4,35 @@ admin app's own Ask AI calls into (see ai_command below).
 
 from __future__ import annotations
 
-from bottle import request, response
-
 from app import app, render
-from models import ChatMessage, ChatThread, TeamMember
+from asgi import request, response
+from models import ChatMessage, ChatThread, TeamMember, db
 from utils import current_user, flash, redirect, require_internal_secret, url_for
 import ai
 
 
 @app.route("/chat", method="GET", name="chat")
-def chat_page():
-    thread = ChatThread.select().where(ChatThread.user == current_user()).first()
-    messages = list(ChatMessage.select().where(ChatMessage.thread == thread).order_by(ChatMessage.id)) if thread else []
+async def chat_page():
+    user = await current_user()
+    thread = await db.first(ChatThread.select().where(ChatThread.user == user))
+    messages = (
+        await db.list(ChatMessage.select().where(ChatMessage.thread == thread).order_by(ChatMessage.id))
+        if thread else []
+    )
     rendered = [
         {"role": m.role, "html": ai.render_markdown(m.content) if m.role == "assistant" else m.content}
         for m in messages
     ]
-    pending = ai.pending_state(thread) if thread else None
-    return render("chat.html", messages=rendered, backend=ai.backend(), pending=pending)
+    pending = await ai.pending_state(thread) if thread else None
+    return await render("chat.html", messages=rendered, backend=ai.backend(), pending=pending)
 
 
 @app.route("/chat", method="POST", name="chat_send")
-def chat_send():
+async def chat_send():
     text = (request.forms.get("message") or "").strip()
     if text:
         try:
-            ai.send_message(current_user(), text)
+            await ai.send_message(await current_user(), text)
         except ai.PendingActionError:
             flash("Please confirm or cancel the pending action first.", "error")
         except ai.LLMError as e:
@@ -40,10 +43,10 @@ def chat_send():
 
 
 @app.route("/chat/confirm", method="POST", name="chat_confirm")
-def chat_confirm():
-    thread, _ = ChatThread.get_or_create(user=current_user())
+async def chat_confirm():
+    thread, _ = await ChatThread.aget_or_create(user=await current_user())
     try:
-        ai.resolve_pending(thread, approved=True)
+        await ai.resolve_pending(thread, approved=True)
     except ValueError:
         pass  # nothing pending (stale double-submit) — ignore
     except ai.LLMError as e:
@@ -52,10 +55,10 @@ def chat_confirm():
 
 
 @app.route("/chat/cancel", method="POST", name="chat_cancel")
-def chat_cancel():
-    thread, _ = ChatThread.get_or_create(user=current_user())
+async def chat_cancel():
+    thread, _ = await ChatThread.aget_or_create(user=await current_user())
     try:
-        ai.resolve_pending(thread, approved=False)
+        await ai.resolve_pending(thread, approved=False)
     except ValueError:
         pass
     except ai.LLMError as e:
@@ -65,7 +68,7 @@ def chat_cancel():
 
 @app.route("/internal/ai-command", method="POST", name="ai_command")
 @require_internal_secret
-def ai_command():
+async def ai_command():
     """The admin app's own Ask AI proxies a natural-language instruction
     here rather than reaching into this app's database directly — this app
     already has the right tools, validation, and confirmation flow for its
@@ -79,20 +82,23 @@ def ai_command():
     Apps write tools (edit_app_code etc.) apply immediately with no separate
     pause.
     """
-    body = request.json or {}
+    try:
+        body = await request.json() or {}
+    except ValueError:
+        body = {}
     text = (body.get("instruction") or "").strip()
     if not text:
         response.status = 400
         return {"error": "instruction is required."}
 
-    owner_membership = TeamMember.select().where(TeamMember.role == "owner").first()
+    owner_membership = await db.first(TeamMember.select().where(TeamMember.role == "owner"))
     if owner_membership is None:
         response.status = 500
         return {"error": "No owner account found to act as."}
-    actor = owner_membership.user
+    actor = await owner_membership.afetch(TeamMember.user)
 
     try:
-        _, assistant_msg = ai.send_message(actor, text)
+        _, assistant_msg = await ai.send_message(actor, text)
     except ai.PendingActionError:
         response.status = 409
         return {"error": "This app's chat already has an action awaiting confirmation — resolve that first."}
@@ -107,9 +113,9 @@ def ai_command():
         # send_message() paused for confirmation — auto-apply it (see the
         # docstring above) instead of leaving it stuck in this app's own
         # pending-action slot, where nothing would ever resolve it.
-        thread, _ = ChatThread.get_or_create(user=actor)
+        thread, _ = await ChatThread.aget_or_create(user=actor)
         try:
-            assistant_msg = ai.resolve_pending(thread, approved=True)
+            assistant_msg = await ai.resolve_pending(thread, approved=True)
         except ai.LLMError as e:
             return {"reply": f"The change was applied, but I couldn't get a follow-up reply: {e}"}
 

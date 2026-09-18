@@ -6,36 +6,35 @@ import html
 import os
 import re
 
-from bottle import request
-
 from app import BASE_DIR, app, render
-from models import Invite, TeamMember, User
+from asgi import request
+from models import Invite, TeamMember, User, db
 from utils import current_user, flash, hash_password, redirect, require_role, team_member, url_for, verify_password
 
 
-def _team_members() -> list[dict]:
-    rows = TeamMember.select().join(User)
-    return [{"member": m, "user": m.user} for m in rows]
+async def _team_members() -> list[dict]:
+    rows = await db.list(TeamMember.select().join(User))
+    return [{"member": m, "user": await m.afetch(TeamMember.user)} for m in rows]
 
 
 @app.route("/settings", method="GET", name="settings")
-def settings_page():
-    member = team_member()
-    return render(
+async def settings_page():
+    member = await team_member()
+    return await render(
         "settings.html",
         member=member,
-        team=_team_members(),
-        pending_invites=list(Invite.select().where(Invite.accepted == False)),  # noqa: E712
+        team=await _team_members(),
+        pending_invites=await db.list(Invite.select().where(Invite.accepted == False)),  # noqa: E712
     )
 
 
 @app.route("/settings/password", method="POST", name="settings_password")
-def settings_password():
+async def settings_password():
     # Redirects target the #change-password <details> fragment — browsers
     # auto-expand a <details> containing the :target element, so the form
     # (hidden behind a summary the rest of the time) stays open/visible
     # across the redirect instead of swallowing its own error message.
-    user = current_user()
+    user = await current_user()
     current_password = request.forms.get("current_password") or ""
     new_password = request.forms.get("new_password") or ""
     if not verify_password(current_password, user.password_hash):
@@ -45,7 +44,7 @@ def settings_password():
         flash("New password must be at least 8 characters.", "error")
         redirect(url_for("settings") + "#change-password")
     user.password_hash = hash_password(new_password)
-    user.save()
+    await user.asave()
     flash("Password changed.", "success")
     redirect(url_for("settings") + "#change-password")
 
@@ -57,6 +56,10 @@ def settings_password():
 # sync by hand. Current values come from os.environ (what the running
 # process actually has loaded), not a re-read of the file, so the form
 # reflects reality even if .env was hand-edited since the last restart.
+#
+# Plain synchronous file I/O throughout this section — no database involved,
+# and these routes are low-frequency admin actions, not hot paths worth an
+# async rewrite of a few local open()/read()/write() calls.
 # ---------------------------------------------------------------------------
 
 _ENV_PATH = os.path.join(BASE_DIR, ".env")
@@ -110,7 +113,7 @@ def _env_sections() -> list[dict]:
     # with a "- " bullet or two); a plain space-join reads as a run-on
     # sentence, so keep the line breaks as <br>s instead. Source is our own
     # checked-in file, not user input, but still escape it — it's the right
-    # default for anything landing in a template with `{{!...}}`.
+    # default for anything landing in a template with `| safe`.
     for section in sections:
         section["description_html"] = "<br>".join(html.escape(line) for line in section["description"])
     return sections
@@ -180,10 +183,10 @@ def _write_env(submitted: dict[str, str]) -> None:
 
 @app.route("/settings/env", method="GET", name="settings_env")
 @require_role("owner")
-def settings_env_page():
+async def settings_env_page():
     sections = _env_sections()
     current = {f["key"]: os.environ.get(f["key"], "") for s in sections for f in s["fields"]}
-    return render(
+    return await render(
         "settings_env.html",
         sections=sections,
         current=current,
@@ -193,7 +196,7 @@ def settings_env_page():
 
 @app.route("/settings/env", method="POST", name="settings_env_save")
 @require_role("owner")
-def settings_env_save():
+async def settings_env_save():
     sections = _env_sections()
     all_keys = [f["key"] for s in sections for f in s["fields"]]
     submitted = {key: request.forms.get(key) or "" for key in all_keys}

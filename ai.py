@@ -8,7 +8,12 @@ Two interchangeable backends (matches admin/services/ai.py's shape):
 
 Both speak stdlib urllib.request + json — no HTTP client dependency, and no
 certifi: plain ssl.create_default_context() works fine against api.openai.com
-on Linux via the system CA bundle.
+on Linux via the system CA bundle. The actual urlopen() call runs via
+asyncio.to_thread (see _http_json) so a multi-second LLM round-trip doesn't
+block the event loop other requests are running on — everything else here
+(every _tool_* function, send_message, resolve_pending) talks to the
+database through playhouse.pwasyncio directly (see models.py) rather than
+a thread hop, since those are already non-blocking.
 
 Markdown is rendered ONLY here. Task/Client descriptions and comments
 elsewhere in the app are plain text (CSS white-space: pre-wrap) — this is a
@@ -19,18 +24,18 @@ a real Markdown library.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import html as _html
 import json
 import os
 import re
 import ssl
-import time
 import urllib.error
 import urllib.request
 from typing import Any
 
-from models import CLIENT_STATUSES, TASK_STATUSES, ChatMessage, ChatThread, Client, Reminder, Task, User
+from models import CLIENT_STATUSES, TASK_STATUSES, ChatMessage, ChatThread, Client, Reminder, Task, User, db
 from utils import notify, record_activity
 
 REQUEST_TIMEOUT = 120
@@ -359,57 +364,65 @@ def _client_row(c: Client) -> dict:
     }
 
 
-def _task_row(t: Task) -> dict:
+async def _task_row(t: Task) -> dict:
+    client_name = None
+    if t.client_id:
+        client = await t.afetch(Task.client)
+        client_name = client.name
+    assignee_name = None
+    if t.assignee_id:
+        assignee = await t.afetch(Task.assignee)
+        assignee_name = assignee.name
     return {
         "id": t.id, "title": t.title, "status": t.status,
-        "client_id": t.client_id, "client_name": t.client.name if t.client_id else None,
-        "assignee": t.assignee.name if t.assignee_id else None,
+        "client_id": t.client_id, "client_name": client_name,
+        "assignee": assignee_name,
         "created_at": t.created_at.isoformat() if t.created_at else None,
     }
 
 
-def _tool_list_clients(*, status: str | None = None, limit: int = 20) -> dict:
+async def _tool_list_clients(*, status: str | None = None, limit: int = 20) -> dict:
     limit = max(1, min(int(limit or 20), 50))
     q = Client.select().where(Client.archived_at.is_null(True) & Client.deleted_at.is_null(True))
     if status:
         q = q.where(Client.status == status)
-    rows = list(q.order_by(Client.created_at.desc()).limit(limit))
+    rows = await db.list(q.order_by(Client.created_at.desc()).limit(limit))
     return {"count": len(rows), "clients": [_client_row(c) for c in rows]}
 
 
-def _tool_get_client(*, client_id: int) -> dict:
+async def _tool_get_client(*, client_id: int) -> dict:
     try:
-        c = Client.get_by_id(client_id)
+        c = await Client.aget_by_id(client_id)
     except Client.DoesNotExist:
         return {"error": f"No client #{client_id}."}
-    tasks = list(
+    tasks = await db.list(
         Task.select().where(
             (Task.client == c) & Task.archived_at.is_null(True) & Task.deleted_at.is_null(True)
         )
     )
-    return {**_client_row(c), "notes": c.notes, "tasks": [_task_row(t) for t in tasks]}
+    return {**_client_row(c), "notes": c.notes, "tasks": [await _task_row(t) for t in tasks]}
 
 
-def _tool_list_tasks(*, status: str | None = None, client_id: int | None = None, limit: int = 20) -> dict:
+async def _tool_list_tasks(*, status: str | None = None, client_id: int | None = None, limit: int = 20) -> dict:
     limit = max(1, min(int(limit or 20), 50))
     q = Task.select().where(Task.archived_at.is_null(True) & Task.deleted_at.is_null(True))
     if status:
         q = q.where(Task.status == status)
     if client_id:
         q = q.where(Task.client == client_id)
-    rows = list(q.order_by(Task.position, Task.id).limit(limit))
-    return {"count": len(rows), "tasks": [_task_row(t) for t in rows]}
+    rows = await db.list(q.order_by(Task.position, Task.id).limit(limit))
+    return {"count": len(rows), "tasks": [await _task_row(t) for t in rows]}
 
 
-def _tool_get_task(*, task_id: int) -> dict:
+async def _tool_get_task(*, task_id: int) -> dict:
     try:
-        t = Task.get_by_id(task_id)
+        t = await Task.aget_by_id(task_id)
     except Task.DoesNotExist:
         return {"error": f"No task #{task_id}."}
-    return {**_task_row(t), "description": t.description}
+    return {**(await _task_row(t)), "description": t.description}
 
 
-def _tool_search(*, query: str, limit: int = 10) -> dict:
+async def _tool_search(*, query: str, limit: int = 10) -> dict:
     """Plain substring search across Client + Task — no FTS index, just
     name/email/company and title/description LIKE matches. Small enough for
     this app's scale, and matches the per-page search boxes on the Clients
@@ -419,7 +432,7 @@ def _tool_search(*, query: str, limit: int = 10) -> dict:
     hits: list[dict] = []
     if not query:
         return {"query": query, "hits": hits}
-    clients = (
+    clients = await db.list(
         Client.select()
         .where(
             Client.deleted_at.is_null(True)
@@ -429,7 +442,7 @@ def _tool_search(*, query: str, limit: int = 10) -> dict:
     )
     for c in clients:
         hits.append({"subject_type": "client", "subject_id": c.id, "title": c.name, "snippet": c.company})
-    tasks = (
+    tasks = await db.list(
         Task.select()
         .where(
             Task.deleted_at.is_null(True)
@@ -454,27 +467,27 @@ def _tool_search(*, query: str, limit: int = 10) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _tool_create_client(*, actor, name: str, email: str = "", phone: str = "",
-                         company: str = "", status: str = "lead", notes: str = "") -> dict:
+async def _tool_create_client(*, actor, name: str, email: str = "", phone: str = "",
+                               company: str = "", status: str = "lead", notes: str = "") -> dict:
     name = (name or "").strip()
     if not name:
         return {"error": "A client needs a name."}
     if status not in CLIENT_STATUSES:
         return {"error": f"Invalid status {status!r}; must be one of {CLIENT_STATUSES}."}
-    client = Client.create(
+    client = await Client.acreate(
         name=name, email=(email or "").strip(), phone=(phone or "").strip(),
         company=(company or "").strip(), status=status, notes=(notes or "").strip(),
         created_by=actor,
     )
-    record_activity("client", client.id, actor, "created")
+    await record_activity("client", client.id, actor, "created")
     return {"ok": True, **_client_row(client)}
 
 
-def _tool_update_client(*, actor, client_id: int, name: str | None = None, email: str | None = None,
-                         phone: str | None = None, company: str | None = None,
-                         status: str | None = None, notes: str | None = None) -> dict:
+async def _tool_update_client(*, actor, client_id: int, name: str | None = None, email: str | None = None,
+                               phone: str | None = None, company: str | None = None,
+                               status: str | None = None, notes: str | None = None) -> dict:
     try:
-        client = Client.get_by_id(client_id)
+        client = await Client.aget_by_id(client_id)
     except Client.DoesNotExist:
         return {"error": f"No client #{client_id}."}
     if client.archived_at is not None:
@@ -490,53 +503,53 @@ def _tool_update_client(*, actor, client_id: int, name: str | None = None, email
     if not changed:
         return {"error": "No fields supplied to update."}
     client.updated_at = datetime.datetime.now()
-    client.save()
-    record_activity("client", client.id, actor, "updated")
+    await client.asave()
+    await record_activity("client", client.id, actor, "updated")
     return {"ok": True, **_client_row(client)}
 
 
-def _tool_archive_client(*, actor, client_id: int) -> dict:
+async def _tool_archive_client(*, actor, client_id: int) -> dict:
     try:
-        client = Client.get_by_id(client_id)
+        client = await Client.aget_by_id(client_id)
     except Client.DoesNotExist:
         return {"error": f"No client #{client_id}."}
     if client.archived_at is not None:
         return {"error": f"Client #{client_id} is already archived."}
     client.archived_at = datetime.datetime.now()
-    client.save()
-    record_activity("client", client.id, actor, "archived")
+    await client.asave()
+    await record_activity("client", client.id, actor, "archived")
     return {"ok": True, "id": client.id, "name": client.name}
 
 
-def _tool_delete_client(*, actor, client_id: int) -> dict:
+async def _tool_delete_client(*, actor, client_id: int) -> dict:
     """Client.soft_delete = True (see models.py) means delete_instance()
     never actually removes the row — it sets deleted_at, same as clicking
     "Delete client" in the UI, and restore_client undoes it."""
     try:
-        client = Client.get_by_id(client_id)
+        client = await Client.aget_by_id(client_id)
     except Client.DoesNotExist:
         return {"error": f"No client #{client_id}."}
     if client.deleted_at is not None:
         return {"error": f"Client #{client_id} is already deleted."}
-    client.delete_instance()
-    record_activity("client", client.id, actor, "deleted")
+    await client.adelete_instance()
+    await record_activity("client", client.id, actor, "deleted")
     return {"ok": True, "id": client.id, "name": client.name}
 
 
-def _tool_restore_client(*, actor, client_id: int) -> dict:
+async def _tool_restore_client(*, actor, client_id: int) -> dict:
     try:
-        client = Client.get_by_id(client_id)
+        client = await Client.aget_by_id(client_id)
     except Client.DoesNotExist:
         return {"error": f"No client #{client_id}."}
     if client.deleted_at is None:
         return {"error": f"Client #{client_id} isn't deleted."}
-    client.restore()
-    record_activity("client", client.id, actor, "restored")
+    await client.arestore()
+    await record_activity("client", client.id, actor, "restored")
     return {"ok": True, "id": client.id, "name": client.name}
 
 
-def _tool_create_task(*, actor, title: str, description: str = "", status: str = "todo",
-                       client_id: int | None = None, assignee_id: int | None = None) -> dict:
+async def _tool_create_task(*, actor, title: str, description: str = "", status: str = "todo",
+                             client_id: int | None = None, assignee_id: int | None = None) -> dict:
     title = (title or "").strip()
     if not title:
         return {"error": "A task needs a title."}
@@ -545,32 +558,32 @@ def _tool_create_task(*, actor, title: str, description: str = "", status: str =
     client_obj = None
     if client_id:
         try:
-            client_obj = Client.get_by_id(client_id)
+            client_obj = await Client.aget_by_id(client_id)
         except Client.DoesNotExist:
             return {"error": f"No client #{client_id}."}
     assignee_obj = None
     if assignee_id:
         try:
-            assignee_obj = User.get_by_id(assignee_id)
+            assignee_obj = await User.aget_by_id(assignee_id)
         except User.DoesNotExist:
             return {"error": f"No user #{assignee_id}."}
-    last = Task.select().order_by(Task.position.desc()).first()
-    task = Task.create(
+    last = await db.first(Task.select().order_by(Task.position.desc()))
+    task = await Task.acreate(
         title=title, description=(description or "").strip(), status=status,
         client=client_obj, assignee=assignee_obj,
         position=(last.position + 1) if last else 0, created_by=actor,
     )
-    record_activity("task", task.id, actor, "created")
+    await record_activity("task", task.id, actor, "created")
     if task.assignee_id and task.assignee_id != actor.id:
-        notify(task.assignee, "assignment", task_id=task.id, task_title=task.title)
-    return {"ok": True, **_task_row(task)}
+        await notify(assignee_obj, "assignment", task_id=task.id, task_title=task.title)
+    return {"ok": True, **(await _task_row(task))}
 
 
-def _tool_update_task(*, actor, task_id: int, title: str | None = None, description: str | None = None,
-                       status: str | None = None, client_id: int | None = None,
-                       assignee_id: int | None = None) -> dict:
+async def _tool_update_task(*, actor, task_id: int, title: str | None = None, description: str | None = None,
+                             status: str | None = None, client_id: int | None = None,
+                             assignee_id: int | None = None) -> dict:
     try:
-        task = Task.get_by_id(task_id)
+        task = await Task.aget_by_id(task_id)
     except Task.DoesNotExist:
         return {"error": f"No task #{task_id}."}
     if task.archived_at is not None:
@@ -582,11 +595,12 @@ def _tool_update_task(*, actor, task_id: int, title: str | None = None, descript
             task.client = None
         else:
             try:
-                task.client = Client.get_by_id(client_id)
+                task.client = await Client.aget_by_id(client_id)
             except Client.DoesNotExist:
                 return {"error": f"No client #{client_id}."}
     old_status = task.status
     reassigned = False
+    new_assignee = None
     if title is not None:
         task.title = title.strip()
     if description is not None:
@@ -598,64 +612,64 @@ def _tool_update_task(*, actor, task_id: int, title: str | None = None, descript
             new_assignee = None
         else:
             try:
-                new_assignee = User.get_by_id(assignee_id)
+                new_assignee = await User.aget_by_id(assignee_id)
             except User.DoesNotExist:
                 return {"error": f"No user #{assignee_id}."}
         reassigned = new_assignee is not None and new_assignee.id != task.assignee_id
         task.assignee = new_assignee
     task.updated_at = datetime.datetime.now()
-    task.save()
+    await task.asave()
     if task.status != old_status:
-        record_activity("task", task.id, actor, "status_changed", old=old_status, new=task.status)
+        await record_activity("task", task.id, actor, "status_changed", old=old_status, new=task.status)
     else:
-        record_activity("task", task.id, actor, "updated")
+        await record_activity("task", task.id, actor, "updated")
     if reassigned and task.assignee_id != actor.id:
-        notify(task.assignee, "assignment", task_id=task.id, task_title=task.title)
-    return {"ok": True, **_task_row(task)}
+        await notify(new_assignee, "assignment", task_id=task.id, task_title=task.title)
+    return {"ok": True, **(await _task_row(task))}
 
 
-def _tool_archive_task(*, actor, task_id: int) -> dict:
+async def _tool_archive_task(*, actor, task_id: int) -> dict:
     try:
-        task = Task.get_by_id(task_id)
+        task = await Task.aget_by_id(task_id)
     except Task.DoesNotExist:
         return {"error": f"No task #{task_id}."}
     if task.archived_at is not None:
         return {"error": f"Task #{task_id} is already archived."}
     task.archived_at = datetime.datetime.now()
-    task.save()
-    record_activity("task", task.id, actor, "archived")
+    await task.asave()
+    await record_activity("task", task.id, actor, "archived")
     return {"ok": True, "id": task.id, "title": task.title}
 
 
-def _tool_delete_task(*, actor, task_id: int) -> dict:
+async def _tool_delete_task(*, actor, task_id: int) -> dict:
     """Task.soft_delete = True (see models.py) means delete_instance()
     never actually removes the row — it sets deleted_at, same as clicking
     "Delete task" in the UI, and restore_task undoes it."""
     try:
-        task = Task.get_by_id(task_id)
+        task = await Task.aget_by_id(task_id)
     except Task.DoesNotExist:
         return {"error": f"No task #{task_id}."}
     if task.deleted_at is not None:
         return {"error": f"Task #{task_id} is already deleted."}
-    task.delete_instance()
-    record_activity("task", task.id, actor, "deleted")
+    await task.adelete_instance()
+    await record_activity("task", task.id, actor, "deleted")
     return {"ok": True, "id": task.id, "title": task.title}
 
 
-def _tool_restore_task(*, actor, task_id: int) -> dict:
+async def _tool_restore_task(*, actor, task_id: int) -> dict:
     try:
-        task = Task.get_by_id(task_id)
+        task = await Task.aget_by_id(task_id)
     except Task.DoesNotExist:
         return {"error": f"No task #{task_id}."}
     if task.deleted_at is None:
         return {"error": f"Task #{task_id} isn't deleted."}
-    task.restore()
-    record_activity("task", task.id, actor, "restored")
+    await task.arestore()
+    await record_activity("task", task.id, actor, "restored")
     return {"ok": True, "id": task.id, "title": task.title}
 
 
-def _tool_create_reminder(*, actor, message: str, remind_in_minutes: int,
-                           client_id: int | None = None, task_id: int | None = None) -> dict:
+async def _tool_create_reminder(*, actor, message: str, remind_in_minutes: int,
+                                 client_id: int | None = None, task_id: int | None = None) -> dict:
     message = (message or "").strip()
     if not message:
         return {"error": "A reminder needs a message."}
@@ -672,18 +686,18 @@ def _tool_create_reminder(*, actor, message: str, remind_in_minutes: int,
     subject_type = subject_id = None
     if client_id:
         try:
-            Client.get_by_id(client_id)
+            await Client.aget_by_id(client_id)
         except Client.DoesNotExist:
             return {"error": f"No client #{client_id}."}
         subject_type, subject_id = "client", client_id
     elif task_id:
         try:
-            Task.get_by_id(task_id)
+            await Task.aget_by_id(task_id)
         except Task.DoesNotExist:
             return {"error": f"No task #{task_id}."}
         subject_type, subject_id = "task", task_id
     remind_at = datetime.datetime.now() + datetime.timedelta(minutes=remind_in_minutes)
-    reminder = Reminder.create(
+    reminder = await Reminder.acreate(
         user=actor, message=message, remind_at=remind_at,
         subject_type=subject_type, subject_id=subject_id, created_by=actor,
     )
@@ -710,14 +724,14 @@ _DISPATCH = {
 }
 
 
-def _execute_tool(name: str, args: dict, *, actor) -> dict:
+async def _execute_tool(name: str, args: dict, *, actor) -> dict:
     fn = _DISPATCH.get(name)
     if fn is None:
         return {"error": f"Unknown tool: {name}"}
     try:
         if name in _MUTATING_TOOLS:
-            return fn(actor=actor, **args)
-        return fn(**args)
+            return await fn(actor=actor, **args)
+        return await fn(**args)
     except TypeError as e:
         return {"error": f"Bad arguments to {name}: {e}"}
     except Exception as e:
@@ -728,23 +742,26 @@ def _execute_tool(name: str, args: dict, *, actor) -> dict:
         return {"error": f"{name} failed: {e}"}
 
 
-def _client_label(client_id) -> str:
+async def _client_label(client_id) -> str:
     try:
-        return f"client #{client_id} ({Client.get_by_id(client_id).name})"
+        c = await Client.aget_by_id(client_id)
+        return f"client #{client_id} ({c.name})"
     except Exception:
         return f"client #{client_id}"
 
 
-def _task_label(task_id) -> str:
+async def _task_label(task_id) -> str:
     try:
-        return f'task #{task_id} ("{Task.get_by_id(task_id).title}")'
+        t = await Task.aget_by_id(task_id)
+        return f'task #{task_id} ("{t.title}")'
     except Exception:
         return f"task #{task_id}"
 
 
-def _user_label(user_id) -> str:
+async def _user_label(user_id) -> str:
     try:
-        return User.get_by_id(user_id).name
+        u = await User.aget_by_id(user_id)
+        return u.name
     except Exception:
         return f"user #{user_id}"
 
@@ -761,44 +778,44 @@ def _format_minutes(minutes: int) -> str:
     return f"{minutes} minute{'s' if minutes != 1 else ''}"
 
 
-def _describe_tool_call(name: str, args: dict) -> str:
+async def _describe_tool_call(name: str, args: dict) -> str:
     """Plain-language summary of a proposed write, for the confirmation UI —
     resolves ids to real names via a lookup, never echoes raw tool-call JSON."""
     if name == "create_client":
         return f'Create a new client named "{args.get("name", "?")}".'
     if name == "archive_client":
-        return f"Archive {_client_label(args.get('client_id'))}."
+        return f"Archive {await _client_label(args.get('client_id'))}."
     if name == "delete_client":
-        return f"Delete {_client_label(args.get('client_id'))}."
+        return f"Delete {await _client_label(args.get('client_id'))}."
     if name == "restore_client":
-        return f"Restore {_client_label(args.get('client_id'))}."
+        return f"Restore {await _client_label(args.get('client_id'))}."
     if name == "update_client":
-        label = _client_label(args.get("client_id"))
+        label = await _client_label(args.get("client_id"))
         parts = [f"{k} to {v!r}" for k, v in args.items() if k != "client_id"]
         return f"Update {label}: set " + ", ".join(parts) + "." if parts else f"Update {label} (no changes given)."
     if name == "create_task":
         bits = [f'Create a new task titled "{args.get("title", "?")}"']
         if args.get("client_id"):
-            bits.append(f"linked to {_client_label(args['client_id'])}")
+            bits.append(f"linked to {await _client_label(args['client_id'])}")
         if args.get("assignee_id"):
-            bits.append(f"assigned to {_user_label(args['assignee_id'])}")
+            bits.append(f"assigned to {await _user_label(args['assignee_id'])}")
         return ", ".join(bits) + "."
     if name == "archive_task":
-        return f"Archive {_task_label(args.get('task_id'))}."
+        return f"Archive {await _task_label(args.get('task_id'))}."
     if name == "delete_task":
-        return f"Delete {_task_label(args.get('task_id'))}."
+        return f"Delete {await _task_label(args.get('task_id'))}."
     if name == "restore_task":
-        return f"Restore {_task_label(args.get('task_id'))}."
+        return f"Restore {await _task_label(args.get('task_id'))}."
     if name == "update_task":
-        label = _task_label(args.get("task_id"))
+        label = await _task_label(args.get("task_id"))
         parts = []
         for k, v in args.items():
             if k == "task_id":
                 continue
             if k == "client_id":
-                parts.append("client to " + (_client_label(v) if v else "none"))
+                parts.append("client to " + (await _client_label(v) if v else "none"))
             elif k == "assignee_id":
-                parts.append("assignee to " + (_user_label(v) if v else "unassigned"))
+                parts.append("assignee to " + (await _user_label(v) if v else "unassigned"))
             else:
                 parts.append(f"{k} to {v!r}")
         return f"Update {label}: set " + ", ".join(parts) + "." if parts else f"Update {label} (no changes given)."
@@ -806,9 +823,9 @@ def _describe_tool_call(name: str, args: dict) -> str:
         when = _format_minutes(args.get("remind_in_minutes") or 0)
         bits = [f'Remind you in {when}: "{args.get("message", "?")}"']
         if args.get("client_id"):
-            bits.append(f"(about {_client_label(args['client_id'])})")
+            bits.append(f"(about {await _client_label(args['client_id'])})")
         if args.get("task_id"):
-            bits.append(f"(about {_task_label(args['task_id'])})")
+            bits.append(f"(about {await _task_label(args['task_id'])})")
         return " ".join(bits) + "."
     return f"{name}({json.dumps(args, ensure_ascii=False)})"
 
@@ -853,15 +870,15 @@ asking about a specific id. If a tool returns an error, relay it plainly rather 
 something up."""
 
 
-def _build_messages(thread: ChatThread, user_text: str) -> list[dict]:
+async def _build_messages(thread: ChatThread, user_text: str) -> list[dict]:
     today = datetime.date.today()
     system = SYSTEM_PROMPT + f"\n\nToday's date is {today:%A, %Y-%m-%d}."
-    history = list(
+    history = (await db.list(
         ChatMessage.select()
         .where(ChatMessage.thread == thread)
         .order_by(ChatMessage.id.desc())
         .limit(HISTORY_MESSAGES)
-    )[::-1]
+    ))[::-1]
     messages = [{"role": "system", "content": system}]
     for m in history:
         messages.append({"role": m.role, "content": m.content})
@@ -873,7 +890,16 @@ _RATE_LIMIT_MAX_RETRIES = 3
 _RATE_LIMIT_BASE_DELAY = 0.5  # seconds; doubles each retry (0.5, 1, 2)
 
 
-def _http_json(url: str, *, payload: dict, headers: dict[str, str] | None = None) -> dict:
+def _urlopen_json(req: urllib.request.Request) -> dict:
+    """The actual blocking call — kept as its own plain sync function so
+    _http_json below can hand the *entire* attempt (connect, send, read,
+    parse) to a worker thread via asyncio.to_thread, rather than just the
+    urlopen() part in isolation."""
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=_SSL_CTX) as r:
+        return json.loads(r.read())
+
+
+async def _http_json(url: str, *, payload: dict, headers: dict[str, str] | None = None) -> dict:
     body = json.dumps(payload).encode("utf-8")
     hdrs = {"Content-Type": "application/json"}
     if headers:
@@ -882,8 +908,7 @@ def _http_json(url: str, *, payload: dict, headers: dict[str, str] | None = None
     delay = _RATE_LIMIT_BASE_DELAY
     for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
         try:
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=_SSL_CTX) as r:
-                return json.loads(r.read())
+            return await asyncio.to_thread(_urlopen_json, req)
         except urllib.error.HTTPError as e:
             # 429 (tokens-per-minute) is shared across every app using the same
             # OPENAI_API_KEY (admin and every provisioned instance share one), so
@@ -893,7 +918,7 @@ def _http_json(url: str, *, payload: dict, headers: dict[str, str] | None = None
             # retries are exhausted does this surface a clean message instead of
             # the raw JSON error body.
             if e.code == 429 and attempt < _RATE_LIMIT_MAX_RETRIES:
-                time.sleep(delay)
+                await asyncio.sleep(delay)
                 delay *= 2
                 continue
             if e.code == 429:
@@ -925,14 +950,14 @@ def _parse_tool_args(raw: Any) -> dict:
     return {}
 
 
-def _post_openai(convo: list[dict], *, tools: list[dict] | None, key: str) -> dict:
+async def _post_openai(convo: list[dict], *, tools: list[dict] | None, key: str) -> dict:
     payload: dict = {"model": OPENAI_MODEL, "messages": convo, "max_completion_tokens": 1200}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
         if _model_uses_reasoning_effort(OPENAI_MODEL):
             payload["reasoning_effort"] = "none"
-    data = _http_json(
+    data = await _http_json(
         OPENAI_BASE_URL + "/chat/completions", payload=payload, headers={"Authorization": f"Bearer {key}"}
     )
     choices = data.get("choices") or []
@@ -941,14 +966,14 @@ def _post_openai(convo: list[dict], *, tools: list[dict] | None, key: str) -> di
     return choices[0].get("message") or {}
 
 
-def _post_ollama(convo: list[dict], *, tools: list[dict] | None) -> dict:
+async def _post_ollama(convo: list[dict], *, tools: list[dict] | None) -> dict:
     payload: dict = {
         "model": OLLAMA_MODEL, "messages": convo, "stream": False,
         "keep_alive": "30m", "options": {"temperature": 0.3, "num_predict": 1200},
     }
     if tools:
         payload["tools"] = tools
-    data = _http_json(OLLAMA_HOST + "/api/chat", payload=payload)
+    data = await _http_json(OLLAMA_HOST + "/api/chat", payload=payload)
     return data.get("message") or {}
 
 
@@ -969,9 +994,9 @@ class PendingActionError(RuntimeError):
     thread already has a write awaiting confirmation."""
 
 
-def _run_tool_call(tc: dict, actor) -> dict:
+async def _run_tool_call(tc: dict, actor) -> dict:
     fn = tc.get("function") or {}
-    return _execute_tool(fn.get("name", ""), _parse_tool_args(fn.get("arguments")), actor=actor)
+    return await _execute_tool(fn.get("name", ""), _parse_tool_args(fn.get("arguments")), actor=actor)
 
 
 def _append_tool_result(convo: list[dict], tc: dict, result: dict) -> None:
@@ -983,11 +1008,12 @@ def _append_tool_result(convo: list[dict], tc: dict, result: dict) -> None:
     convo.append(tool_msg)
 
 
-def _agent_loop(convo: list[dict], *, backend_name: str, key: str | None = None,
-                 actor, start_round: int = 0) -> str | _NeedsConfirmation:
+async def _agent_loop(convo: list[dict], *, backend_name: str, key: str | None = None,
+                       actor, start_round: int = 0) -> str | _NeedsConfirmation:
     for round_idx in range(start_round, MAX_TOOL_ROUNDTRIPS + 1):
         tools = TOOLS_SCHEMA if round_idx < MAX_TOOL_ROUNDTRIPS else None
-        msg = _post_openai(convo, tools=tools, key=key or "") if backend_name == "openai" else _post_ollama(convo, tools=tools)
+        msg = await (_post_openai(convo, tools=tools, key=key or "") if backend_name == "openai"
+                     else _post_ollama(convo, tools=tools))
         tool_calls = msg.get("tool_calls") or []
         if not tool_calls:
             text = (msg.get("content") or "").strip()
@@ -1003,7 +1029,7 @@ def _agent_loop(convo: list[dict], *, backend_name: str, key: str | None = None,
             (mutating_tcs if name in _MUTATING_TOOLS else immediate_tcs).append(tc)
 
         for tc in immediate_tcs:
-            _append_tool_result(convo, tc, _run_tool_call(tc, actor))
+            _append_tool_result(convo, tc, await _run_tool_call(tc, actor))
 
         if mutating_tcs:
             # Reads in this same round (if any) already ran above and their
@@ -1015,21 +1041,21 @@ def _agent_loop(convo: list[dict], *, backend_name: str, key: str | None = None,
     raise LLMError("Tool loop exceeded — the model never produced a final answer.")
 
 
-def _save_pending(thread: ChatThread, nc: _NeedsConfirmation) -> None:
+async def _save_pending(thread: ChatThread, nc: _NeedsConfirmation) -> None:
     thread.pending_convo = json.dumps(nc.convo, ensure_ascii=False)
     thread.pending_tool_calls = json.dumps(nc.pending_calls, ensure_ascii=False)
     thread.pending_round_idx = nc.round_idx
-    thread.save()
+    await thread.asave()
 
 
-def _clear_pending(thread: ChatThread) -> None:
+async def _clear_pending(thread: ChatThread) -> None:
     thread.pending_convo = None
     thread.pending_tool_calls = None
     thread.pending_round_idx = None
-    thread.save()
+    await thread.asave()
 
 
-def pending_state(thread: ChatThread | None) -> list[dict] | None:
+async def pending_state(thread: ChatThread | None) -> list[dict] | None:
     """For chat_page: [{'name': ..., 'description': ...}, ...] if this
     thread has a write awaiting confirmation, else None."""
     if not thread or not thread.pending_tool_calls:
@@ -1039,11 +1065,11 @@ def pending_state(thread: ChatThread | None) -> list[dict] | None:
         fn = tc.get("function") or {}
         name = fn.get("name", "")
         args = _parse_tool_args(fn.get("arguments"))
-        out.append({"name": name, "description": _describe_tool_call(name, args)})
+        out.append({"name": name, "description": await _describe_tool_call(name, args)})
     return out
 
 
-def send_message(user, text: str) -> tuple[ChatMessage, ChatMessage | None]:
+async def send_message(user, text: str) -> tuple[ChatMessage, ChatMessage | None]:
     """Persist a user turn, call the active LLM backend, persist the reply.
     Raises LLMError (with the user turn rolled back) if the backend fails —
     including when neither OPENAI_API_KEY nor a reachable Ollama is set up,
@@ -1055,30 +1081,30 @@ def send_message(user, text: str) -> tuple[ChatMessage, ChatMessage | None]:
     if not text:
         raise ValueError("empty message")
 
-    thread, _ = ChatThread.get_or_create(user=user)
+    thread, _ = await ChatThread.aget_or_create(user=user)
     if thread.pending_tool_calls:
         raise PendingActionError("Resolve the pending action before sending a new message.")
 
-    user_msg = ChatMessage.create(thread=thread, role="user", content=text)
-    messages = _build_messages(thread, text)
+    user_msg = await ChatMessage.acreate(thread=thread, role="user", content=text)
+    messages = await _build_messages(thread, text)
 
     key = _openai_key()
     backend_name = "openai" if key else "ollama"
     try:
-        result = _agent_loop(messages, backend_name=backend_name, key=key, actor=user)
+        result = await _agent_loop(messages, backend_name=backend_name, key=key, actor=user)
     except LLMError:
-        user_msg.delete_instance()
+        await user_msg.adelete_instance()
         raise
 
     if isinstance(result, _NeedsConfirmation):
-        _save_pending(thread, result)
+        await _save_pending(thread, result)
         return user_msg, None
 
-    assistant_msg = ChatMessage.create(thread=thread, role="assistant", content=result)
+    assistant_msg = await ChatMessage.acreate(thread=thread, role="assistant", content=result)
     return user_msg, assistant_msg
 
 
-def resolve_pending(thread: ChatThread, *, approved: bool) -> ChatMessage | None:
+async def resolve_pending(thread: ChatThread, *, approved: bool) -> ChatMessage | None:
     """Execute (or decline) the pending write(s), resume the same
     conversation, and persist the model's follow-up as a new assistant
     ChatMessage. Returns None if the model's follow-up is itself another
@@ -1090,32 +1116,32 @@ def resolve_pending(thread: ChatThread, *, approved: bool) -> ChatMessage | None
     convo = json.loads(thread.pending_convo)
     pending_calls = json.loads(thread.pending_tool_calls)
     round_idx = thread.pending_round_idx or 0
-    actor = thread.user
+    actor = await thread.afetch(ChatThread.user)
 
     for tc in pending_calls:
-        result = _run_tool_call(tc, actor) if approved else {"error": "The user declined this action."}
+        result = await _run_tool_call(tc, actor) if approved else {"error": "The user declined this action."}
         _append_tool_result(convo, tc, result)
 
     # Note: an approved write above is already committed to the DB. If the
     # follow-up LLM call below fails, that write is NOT rolled back — it's a
     # completed action being reported on, not a draft, unlike send_message's
     # rollback of a pure-read user turn.
-    _clear_pending(thread)
+    await _clear_pending(thread)
 
     key = _openai_key()
     backend_name = "openai" if key else "ollama"
     try:
-        result = _agent_loop(convo, backend_name=backend_name, key=key, actor=actor, start_round=round_idx + 1)
+        result = await _agent_loop(convo, backend_name=backend_name, key=key, actor=actor, start_round=round_idx + 1)
     except LLMError as e:
         verb = "completed" if approved else "cancelled"
         text = f"(The action was {verb}, but I couldn't get a follow-up reply: {e})"
-        return ChatMessage.create(thread=thread, role="assistant", content=text)
+        return await ChatMessage.acreate(thread=thread, role="assistant", content=text)
 
     if isinstance(result, _NeedsConfirmation):
-        _save_pending(thread, result)
+        await _save_pending(thread, result)
         return None
 
-    return ChatMessage.create(thread=thread, role="assistant", content=result)
+    return await ChatMessage.acreate(thread=thread, role="assistant", content=result)
 
 
 # ---------------------------------------------------------------------------

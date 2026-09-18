@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from collections import deque
 
-from bottle import request
+from asgi import request
 
 
 class RateLimiter:

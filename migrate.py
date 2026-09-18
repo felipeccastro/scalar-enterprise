@@ -1,21 +1,19 @@
 """Apply pending database migrations.
 
-Used by `make db-migrate`. Loads .env and puts vendor/ (peewee-migrate and
-the slice of playhouse it needs, alongside peewee/bottle) on sys.path the
-same way app.py does, then applies everything in migrations/.
+Used by `make db-migrate`. Loads .env, then applies everything in
+migrations/.
 
 Deliberately does NOT `import app` to get there, unlike this file's
 counterpart in ../admin/: app.py's own module-level jobs.start() reaches
-for the database the moment it's running, gunicorn worker or not — and
+for the database the moment it's running, uvicorn worker or not — and
 would race this script's own run_migrations() call below for exactly the
 tables a pending migration hasn't created yet.
 """
 
+import asyncio
 import os
-import sys
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(BASE_DIR, "vendor"))
 
 
 def _load_dotenv() -> None:
@@ -42,5 +40,10 @@ _load_dotenv()
 from models import run_migrations  # noqa: E402
 
 if __name__ == "__main__":
-    run_migrations()
+    # run_migrations() is async — see models.py's own comment on why
+    # (peewee-migrate needs a synchronous database; AsyncPostgresqlDatabase
+    # only allows that from inside its "greenlet bridge", db.run(...)).
+    # asyncio.run() here, not a bare coroutine: there's no event loop yet at
+    # module scope, and this script needs exactly one, start to finish.
+    asyncio.run(run_migrations())
     print("Migrations applied.")

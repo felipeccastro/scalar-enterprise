@@ -1,12 +1,14 @@
-# Dev server. `make` (or `make run`) starts gunicorn with autoreload (picks
-# up .py file changes; template/static edits already show up on the next
-# request without a restart, via app.py's DEBUG flag — see app.py) and a
-# worker restart every 1000 requests processed, to shake off any slow memory
-# growth in a long-lived dev session. Same shape of command a provisioned
-# instance runs under (see ../admin/launcher/provisioner.py), just invoked
-# locally instead of by the launcher.
+# Dev server. `make` (or `make run`) starts uvicorn with autoreload (picks
+# up .py file changes; template edits already show up on the next request
+# without a restart, via app.py's DEBUG flag — see app.py's Jinja2
+# Environment's auto_reload). Same shape of command a provisioned instance
+# runs under (see ../admin/launcher/provisioner.py), just invoked locally
+# instead of by the launcher. WORKERS>1 needs its own process-per-worker
+# flag (--workers) instead of gunicorn's; left at the single-worker default
+# since jobs.py's scheduler (see app.py's app.on_startup) would otherwise
+# run once per worker — see jobs.py's own docstring.
 #
-# Migrations are NOT applied here — gunicorn workers importing app:app never
+# Migrations are NOT applied here — uvicorn workers importing app:app never
 # reach its __main__ block (see app.py), so run `make db-migrate` first.
 # `python3 app.py` (this app's own dev server, not this target) still
 # auto-migrates on every run, same as before.
@@ -18,15 +20,15 @@ TS := $(shell date +%Y%m%d-%H%M%S)
 
 .PHONY: run dist db-migrate backup repl test
 run:
-	gunicorn app:app \
-		--bind $(HOST):$(PORT) \
+	python3 -m uvicorn app:app \
+		--host $(HOST) \
+		--port $(PORT) \
 		--workers $(WORKERS) \
-		--reload \
-		--max-requests 1000
+		--reload
 
 # Apply pending migrations/ (see models.py: run_migrations()). Required
 # before `make run` the first time any migration lands after a deploy —
-# gunicorn workers assume the schema is already current, they don't check.
+# uvicorn workers assume the schema is already current, they don't check.
 db-migrate:
 	python3 migrate.py
 
@@ -36,8 +38,9 @@ db-migrate:
 repl:
 	python3 repl.py
 
-# Every user-journey test in tests/, each in its own process against its own
-# throwaway Postgres database — see tests/_harness.py and tests/run_all.py.
+# Every user-journey test in tests/, each run under pytest in its own
+# process against its own throwaway Postgres database — see
+# tests/_harness.py and tests/run_all.py.
 test:
 	python3 tests/run_all.py
 

@@ -65,17 +65,13 @@ stale and stops meaning anything.
 
 ## Conventions specific to this codebase
 
-- **Pip dependencies are fine here, unlike core/pro.** This tier runs
-  against Postgres (see `models.py`), which needs `psycopg2-binary` — a
-  real pip dependency, listed in `requirements.txt` alongside the dev-only
-  `gunicorn` note. `bottle`/`peewee`/`peewee-migrate` (plus the slice of
-  `playhouse` it needs) stay vendored as plain `.py` files in `vendor/` —
-  see the schema bullet below and `vendor/LICENSE.peewee-migrate` — since
-  there's no reason to unvendor something that already works. But don't
-  feel obligated to vendor a *new* small library the way core/pro would;
-  add it to `requirements.txt` instead when that's the more natural fit
-  (e.g. it ships a C extension, like psycopg2 does, or vendoring it would
-  drag in its own dependency tree).
+- **Pip dependencies are fine here, unlike core/pro — nothing is vendored.**
+  This tier runs Starlette (ASGI) + peewee's real async support
+  (`playhouse.pwasyncio`, asyncpg-backed) over Postgres — see
+  `requirements.txt` for the full list (starlette, uvicorn, jinja2,
+  python-multipart, peewee, peewee-migrate, asyncpg, greenlet, pytest).
+  Add a new dependency there directly; there's no vendoring convention to
+  weigh it against here the way core/pro have.
 - **No app-authored JS beyond what's declaratively necessary.** Mobile nav
   uses the checkbox hack; New Client/Task modals open via
   `commandfor`/`command="show-modal"`, wired by the already-vendored
@@ -87,29 +83,34 @@ stale and stops meaning anything.
   do any of them; each is small, single-purpose, and commented inline in
   `layout.html`/`settings.html`. Follow that same shape for anything else
   that genuinely needs script — don't reach for a framework or bundler.
-- **Schema changes go through `migrations/`** (peewee-migrate — vendored,
-  see the dependency bullet above), applied by `run_migrations()` in
-  `models.py`. This is pro's one deliberate divergence from core's
-  idempotent-check-at-startup approach (`core/models.py`'s `ensure_schema()`)
-  — core stays as-is; don't backport migrations there. To add a schema
-  change: edit the model in `models.py`, then add
-  `migrations/NNN_description.py` (next number, `migrate()` +
+- **Schema changes go through `migrations/`** (peewee-migrate), applied by
+  `run_migrations()` in `models.py`. This is pro's one deliberate
+  divergence from core's idempotent-check-at-startup approach
+  (`core/models.py`'s `ensure_schema()`) — core stays as-is; don't backport
+  migrations there. To add a schema change: edit the model in `models.py`,
+  then add `migrations/NNN_description.py` (next number, `migrate()` +
   `rollback()`) — see `migrations/002_client_website.py` for the pattern of
   adding a column, `migrations/001_initial.py` for creating a table.
   Run `make db-migrate` (or just restart `python3 app.py`, which auto-
   migrates on every dev run — see app.py) to apply it.
-  **Migrations are NOT applied automatically under `gunicorn app:app`** —
+  **Migrations are NOT applied automatically under `uvicorn app:app`** —
   a production/self-hosted deploy runs `make db-migrate` as its own
   explicit step before starting the server (same split as `../admin/`);
-  auto-migrating on every gunicorn worker's own import would mean
-  concurrent workers racing to apply the same pending migration.
-- **Bottle template gotcha:** any source line whose first non-whitespace
-  character is `%` is parsed as Python — including inside an HTML comment.
-  Don't write something like a `%rebase(...)` call as documentation text on
-  its own line in a `.html` template; bottle will try to execute it as a
-  statement and throw a `SyntaxError`. (Hit exactly this once — see the git
-  history around the Esc-navigation feature.) If you need to reference
-  template syntax in a comment, keep it mid-line, not line-initial.
+  auto-migrating on every uvicorn worker's own import would mean
+  concurrent workers racing to apply the same pending migration. Note also
+  that `run_migrations()` (and `migrate.py`'s own entrypoint) is `async
+  def` — peewee-migrate needs a synchronous database, and
+  AsyncPostgresqlDatabase only allows that from inside its own "greenlet
+  bridge" (`db.run(...)`) — see models.py's own comment there.
+- **Jinja2 template gotcha:** `{% ... %}`/`{{ ... }}` are parsed as Jinja2
+  syntax *anywhere they appear*, including inside an HTML comment — writing
+  literal template-tag syntax as documentation prose on its own line (e.g.
+  mentioning `{% block foo %}` inside a `<!-- -->` comment describing it)
+  creates a real, unmatched block/tag and breaks the template with a
+  `TemplateSyntaxError`. (Hit exactly this during the Bottle→Starlette
+  migration — see `templates/layout.html`'s Esc-navigation comment.)
+  Describe template syntax in prose instead of writing it literally when
+  documenting a template inline.
 - **Theming:** `style.css`'s `:root` tokens use CSS `light-dark()` keyed off
   the `color-scheme` property, not a `[data-theme="light"]` override block.
   Add new color tokens the same way — `--foo: light-dark(lightVal,
@@ -156,10 +157,9 @@ stale and stops meaning anything.
 
 ## Verifying a change
 
-- **Templates**: bottle's `SimpleTemplate` can compile a template directly
-  (no server needed) to catch syntax errors — `python3 -c "from bottle
-  import SimpleTemplate; SimpleTemplate(open('templates/x.html').read())"`
-  (run with `vendor/` on `sys.path`).
+- **Templates**: Jinja2 can parse a template directly (no server needed) to
+  catch syntax errors — `python3 -c "from jinja2 import Environment,
+  FileSystemLoader; Environment(loader=FileSystemLoader('templates')).get_template('x.html')"`.
 - **Visual/behavioral changes**: run against a scratch database —
   `createdb scratch && PGDATABASE=scratch PORT=8123 python3 app.py` —
   rather than the real `scalar` database, so local data doesn't need

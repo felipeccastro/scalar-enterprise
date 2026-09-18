@@ -3,16 +3,24 @@
 Single-tenant: there is no Workspace concept at all — one instance == one
 customer.
 
-Schema changes go through migrations/ (peewee-migrate — vendored, see
-vendor/peewee_migrate/ and vendor/playhouse/, plus the note on Pro's own
-dependency story in AGENTS.md), applied by run_migrations() at startup (see
-the bottom of this file). This is pro's one deliberate divergence from
-core's zero-pip-dependency, no-migrations-framework rule — see
-AGENTS.md for why the tradeoff was worth it here and core stays as-is.
+Schema changes go through migrations/ (peewee-migrate — a real pip
+dependency, see requirements.txt and AGENTS.md), applied by
+run_migrations() at startup (see the bottom of this file). This is pro's
+one deliberate divergence from core's zero-pip-dependency,
+no-migrations-framework rule — see AGENTS.md for why the tradeoff was
+worth it here and core stays as-is.
 
-Runs against Postgres, not SQLite (see make_database() below) — the one
-real pip dependency this tier carries (psycopg2-binary, see
-requirements.txt); everything else is still vendored.
+Runs against Postgres via playhouse.pwasyncio.AsyncPostgresqlDatabase (see
+make_database() below) — real async I/O over asyncpg, not the thread-pool
+kind. Every Model here mixes in AsyncModelMixin (acreate/aget/aget_or_none/
+asave/adelete_instance/aexecute/...), which is how app.py's route handlers
+and ai.py's tools talk to the database; the plain sync methods
+(save/delete_instance, overridden below for the audit trail/soft-delete,
+and select()/create() generally) still exist and are what the async
+methods actually call under the hood (see pwasyncio's own source: e.g.
+asave() is `await database.run(self.save, ...)`), but calling them bare
+from a route requires the same "greenlet bridge" run_migrations() uses
+below — don't.
 """
 
 from __future__ import annotations
@@ -31,18 +39,18 @@ from peewee import (
     ForeignKeyField,
     IntegerField,
     Model,
-    PostgresqlDatabase,
     TextField,
 )
+from playhouse.pwasyncio import AsyncModelMixin, AsyncPostgresqlDatabase
 
 # The concrete database is chosen at startup (see make_database/init_database)
 # so the choice can be deferred until after .env is loaded (app.py does this).
 db = DatabaseProxy()
 
 
-def make_database() -> PostgresqlDatabase:
-    """Build the concrete database: Postgres, via psycopg2 (see
-    requirements.txt — the one real pip dependency this tier carries).
+def make_database() -> AsyncPostgresqlDatabase:
+    """Build the concrete database: Postgres, via asyncpg (see
+    requirements.txt — playhouse.pwasyncio's own backend for this driver).
 
     Connection params come from the standard libpq env vars, each with a
     default that points at a local instance's "scalar" database on the
@@ -50,8 +58,8 @@ def make_database() -> PostgresqlDatabase:
     - PGHOST (default "localhost")
     - PGPORT (default 5432)
     - PGDATABASE (default "scalar")
-    - PGUSER / PGPASSWORD (unset by default — falls back to psycopg2/libpq's
-      own resolution: OS user, ~/.pgpass, etc.)
+    - PGUSER / PGPASSWORD (unset by default — falls back to asyncpg's own
+      resolution: OS user, ~/.pgpass, etc.)
 
     Create the database once, before the first `make db-migrate` /
     `python3 app.py`: `createdb scalar` (or `psql -c 'CREATE DATABASE
@@ -66,17 +74,17 @@ def make_database() -> PostgresqlDatabase:
         kwargs["user"] = os.environ["PGUSER"]
     if os.environ.get("PGPASSWORD"):
         kwargs["password"] = os.environ["PGPASSWORD"]
-    return PostgresqlDatabase(os.environ.get("PGDATABASE", "scalar"), **kwargs)
+    return AsyncPostgresqlDatabase(os.environ.get("PGDATABASE", "scalar"), **kwargs)
 
 
-def init_database() -> PostgresqlDatabase:
+def init_database() -> AsyncPostgresqlDatabase:
     """Bind the proxy to the concrete backend. Idempotent."""
     if db.obj is None:
         db.initialize(make_database())
     return db.obj
 
 
-class BaseModel(Model):
+class BaseModel(AsyncModelMixin, Model):
     """`audit_trail = True` (opt-in per subclass, off by default here) makes
     save()/delete_instance() write an AuditLog row alongside every write —
     a full snapshot on create, a field-level diff on update, a bare marker
@@ -143,17 +151,32 @@ class BaseModel(Model):
         self.deleted_at = None
         return self.save()
 
+    async def arestore(self):
+        """restore()'s async counterpart — a plain BaseModel addition, not
+        one AsyncModelMixin provides (it only mirrors peewee's own built-in
+        methods), following the exact same shape: bridge into restore()
+        itself so it (and the save() it calls, with the audit trail) runs
+        under the greenlet bridge like every other mutation."""
+        return await db.run(self.restore)
+
 
 def _audit_actor_id() -> int | None:
     """Best-effort current-request user id. None outside a request (a
     background thread, a script) rather than raising — audit metadata
     should never be why a write fails. Imported locally: utils.py has no
-    reason to import models.py at module scope, and this would make it."""
-    try:
-        from utils import current_user
+    reason to import models.py at module scope, and this would make it.
 
-        user = current_user()
-        return user.id if user else None
+    Reads utils.cached_user_id() (sync, cache-only — never touches the
+    database) rather than the real, async current_user(): this runs from
+    inside a plain sync save()/delete_instance(), itself only ever invoked
+    through the asave()/adelete_instance() greenlet bridge (see BaseModel
+    above) — awaiting a fresh async query from in there would need a
+    second, nested bridge for no real benefit over the id current_user()
+    already resolved and cached earlier this same request."""
+    try:
+        from utils import cached_user_id
+
+        return cached_user_id()
     except Exception:
         return None
 
@@ -503,30 +526,30 @@ class ChatMessage(BaseModel):
     created_at = DateTimeField(default=datetime.datetime.now)
 
 
-def seed_demo_data(owner: User) -> None:
+async def seed_demo_data(owner: User) -> None:
     """A couple of realistic Clients/Tasks so a freshly-provisioned instance
     isn't an empty screen. Called once, right after the first owner registers
     (see pages/auth.py:register_owner_submit) — not from run_migrations(),
     since it needs a real User to attribute the rows to."""
-    acme = Client.create(
+    acme = await Client.acreate(
         name="Acme Corp", email="hello@acme.example", company="Acme Corp",
         status="active", notes="Long-time client, monthly retainer.",
         created_by=owner,
     )
-    northwind = Client.create(
+    northwind = await Client.acreate(
         name="Northwind Traders", email="hi@northwind.example", company="Northwind Traders",
         status="lead", notes="Introduced last week, still evaluating.",
         created_by=owner,
     )
-    Task.create(
+    await Task.acreate(
         title="Send onboarding email", status="done",
         client=acme, assignee=owner, position=0, created_by=owner,
     )
-    Task.create(
+    await Task.acreate(
         title="Prepare proposal", description="Cover scope, timeline, and pricing.",
         status="in_progress", client=northwind, assignee=owner, position=1, created_by=owner,
     )
-    Task.create(
+    await Task.acreate(
         title="Quarterly check-in call", status="todo",
         client=acme, assignee=owner, position=2, created_by=owner,
     )
@@ -554,13 +577,47 @@ def _column_exists(table: str, column: str) -> bool:
 MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
 
 
-def run_migrations() -> None:
+def _apply_migrations() -> None:
+    """The actual, synchronous peewee-migrate run — peewee-migrate expects a
+    plain synchronous database (Router.run() calls execute_sql/atomic
+    directly, no await), which AsyncPostgresqlDatabase only allows from
+    inside its own "greenlet bridge" (see run_migrations() below) — bare,
+    it raises MissingGreenletBridge. _column_exists() above is safe to call
+    from within a migration's migrate() for the same reason: it's still
+    running inside that same bridge."""
+    from peewee_migrate import Router
+    from peewee_migrate.models import MigrateHistory
+
+    # peewee_migrate's own migration-history model defaults migrated_at to
+    # an aware datetime (dt.datetime.now(dt.UTC)), but peewee creates a
+    # plain, timezone-naive TIMESTAMP column for a bare DateTimeField —
+    # psycopg2 tolerated that mismatch silently; asyncpg's stricter codec
+    # doesn't, and raises DataError. Patch the default to match the column
+    # it's actually going into rather than carry a Postgres-only fork of
+    # peewee_migrate's own model just for this.
+    #
+    # field.default itself is just documentation once the class exists:
+    # Model.create()/__init__() actually read Metadata.get_default_dict(),
+    # which is built from Metadata._default_callable_list — a (field_name,
+    # callable) snapshot peewee takes once in add_field(), at
+    # class-definition time. Patching field.default (or even
+    # _meta.defaults, a *second*, separately-snapshotted dict that isn't
+    # this one either) afterward doesn't reach it — that list is the one
+    # that actually needs the entry replaced.
+    meta = MigrateHistory._meta
+    meta._default_callable_list = [
+        (name, datetime.datetime.now if name == "migrated_at" else default)
+        for name, default in meta._default_callable_list
+    ]
+
+    router = Router(db.obj, migrate_dir=MIGRATIONS_DIR)
+    router.run()
+
+
+async def run_migrations() -> None:
     """Apply every pending migration in migrations/, in filename order. Safe
     to call on every startup — peewee-migrate tracks what's already applied
     in its own `migratehistory` table, so an already-current database is a
     no-op."""
     init_database()
-    from peewee_migrate import Router
-
-    router = Router(db.obj, migrate_dir=MIGRATIONS_DIR)
-    router.run()
+    await db.run(_apply_migrations)

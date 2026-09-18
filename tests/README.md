@@ -8,19 +8,22 @@ what's on the page.
 
 The intent is that someone who isn't a programmer can read a test file
 top to bottom, as a script of what a specific person did and what they
-should have seen — no mocks, no fixtures full of jargon, no framework
-beyond Python's own standard library (this app has a zero-pip-dependency
-rule; these tests keep it).
+should have seen — no mocks, no fixtures full of jargon. Run under pytest
+(each file drives the *real* app — no test doubles for the framework or
+the database either), plus asyncpg to create/drop each journey's own
+throwaway database (see `_harness.py`).
 
 ## Running them
 
 ```bash
-python3 tests/run_all.py          # every journey
-python3 tests/test_getting_started_journey.py -v   # just one, verbose
+python3 tests/run_all.py                          # every journey
+pytest tests/test_getting_started_journey.py -v   # just one, verbose
 ```
 
-`-v` on a single file prints each test method's one-line docstring next to
-its result — that's the readable summary of what was checked.
+`-v` on a single file prints the test's full name next to its result — the
+method names are written as the readable summary of what was checked
+(`test_a_new_owner_can_sign_up_and_come_back_later`), not a separate
+one-line docstring the way unittest's own `-v` runner would print instead.
 
 ## What's here
 

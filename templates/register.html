@@ -1,9 +1,11 @@
-%rebase('layout', title='Set up your team')
+{% extends "layout.html" %}
+{% block title %}Set up your team{% endblock %}
+{% block content %}
 <div class="auth-card">
   <h1>Set up your team</h1>
   <p class="muted">You're the first person here — this creates the owner account.</p>
-  <form method="post" action="{{url_for('register_owner_submit')}}">
-    <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+  <form method="post" action="{{ url_for('register_owner_submit') }}">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
     <div class="field">
       <label for="name">Your name</label>
       <input type="text" id="name" name="name" required autofocus>
@@ -19,3 +21,4 @@
     <button class="btn btn-primary" type="submit">Create account</button>
   </form>
 </div>
+{% endblock %}

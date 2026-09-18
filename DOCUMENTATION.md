@@ -35,12 +35,14 @@ file attachments, an activity log, in-app notifications, and a read/write
 one team — there's no workspace/org switcher; whoever signs up first is the
 owner, and everyone else joins by invite.
 
-Server-rendered [Bottle](https://bottlepy.org) + [peewee](http://docs.peewee-orm.com)
-over Postgres, styled with the [oat.css](https://oat.style) design-system
-library. No build step, no Node — bottle and peewee are vendored as plain
-`.py` files in `vendor/` — but this tier does need one real pip install:
-`psycopg2` (the Postgres driver). See the [README](README.md) for how to
-run it.
+Server-rendered [Starlette](https://www.starlette.io) (ASGI, async) +
+[peewee](http://docs.peewee-orm.com) over Postgres (via
+playhouse.pwasyncio/asyncpg — real async I/O, not a thread-pool shim),
+styled with the [oat.css](https://oat.style) design-system library.
+Templates are Jinja2. No build step, no Node — but real pip dependencies
+throughout (starlette, peewee, asyncpg, ...; see requirements.txt), unlike
+core/pro, which vendor bottle/peewee as plain `.py` files instead. See the
+[README](README.md) for how to run it.
 
 ## Accounts, team & access
 
@@ -316,9 +318,10 @@ gitignored and excluded from `make dist`.
 
 An `after_request` hook (`_log_request`) writes one line per request —
 `GET /clients -> 200 (4.2ms)` — status and timing included, sourced from
-`response.status_code` in the normal case and hardcoded to 500 for a
-genuine unhandled exception, whose status bottle only applies to
-`response` *after* this hook already ran (see the hook's own comment).
+`response.status` in the normal case and hardcoded to 500 for a genuine
+unhandled exception, whose real status only gets applied to the outgoing
+response *after* this hook already ran, by asgi.py's own error handling
+(see the hook's own comment).
 
 ## Navigation & keyboard
 
@@ -395,7 +398,7 @@ notification still goes out either way.
 ## Data model reference
 
 All models in `models.py`; schema changes are applied by migrations
-(`migrations/`, peewee-migrate — vendored) via `run_migrations()` — see
+(`migrations/`, peewee-migrate) via `run_migrations()` — see
 [AGENTS.md](AGENTS.md) for when that runs and how to add one. This is
 pro's one deliberate divergence from `core/`, which still applies schema
 idempotently at startup with no migrations directory at all.

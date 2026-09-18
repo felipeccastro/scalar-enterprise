@@ -1,26 +1,29 @@
-%rebase('layout', title='Clients', back_url=url_for('dashboard'))
+{% extends "layout.html" %}
+{% block title %}Clients{% endblock %}
+{% block back_url %}{{ url_for('dashboard') }}{% endblock %}
+{% block content %}
 <div class="page-header">
-  <h1>Clients{{' — Deleted' if showing_deleted else ''}}</h1>
-  %if not showing_deleted:
+  <h1>Clients{{ ' — Deleted' if showing_deleted else '' }}</h1>
+  {% if not showing_deleted %}
     <button type="button" class="btn btn-primary" commandfor="new-client-dialog" command="show-modal">+ New client</button>
-  %end
+  {% endif %}
 </div>
 
-<form method="get" action="{{url_for('clients_list')}}" class="search-form">
-  %if showing_deleted:
+<form method="get" action="{{ url_for('clients_list') }}" class="search-form">
+  {% if showing_deleted %}
     <input type="hidden" name="deleted" value="1">
-  %end
-  <input type="search" name="q" value="{{q}}" placeholder="Search clients…">
+  {% endif %}
+  <input type="search" name="q" value="{{ q }}" placeholder="Search clients…">
   <button class="btn" type="submit">Search</button>
-  %if q:
-    <a class="btn-link" href="{{url_for('clients_list', _query={'deleted': '1'} if showing_deleted else {})}}">Clear</a>
-  %end
+  {% if q %}
+    <a class="btn-link" href="{{ url_for('clients_list', _query={'deleted': '1'} if showing_deleted else {}) }}">Clear</a>
+  {% endif %}
   <span class="search-form-spacer"></span>
-  %if showing_deleted:
-    <a class="btn-link" href="{{url_for('clients_list')}}">&larr; Back to clients</a>
-  %else:
-    <a class="btn-link" href="{{url_for('clients_list', _query={'deleted': '1'})}}">View deleted clients</a>
-  %end
+  {% if showing_deleted %}
+    <a class="btn-link" href="{{ url_for('clients_list') }}">&larr; Back to clients</a>
+  {% else %}
+    <a class="btn-link" href="{{ url_for('clients_list', _query={'deleted': '1'}) }}">View deleted clients</a>
+  {% endif %}
 </form>
 
 <dialog id="new-client-dialog">
@@ -28,17 +31,17 @@
     <span class="dialog-title">New client</span>
     <button type="button" class="dialog-close" commandfor="new-client-dialog" command="close" aria-label="Close">✕</button>
   </div>
-  <form method="post" action="{{url_for('clients_create')}}">
-    <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+  <form method="post" action="{{ url_for('clients_create') }}">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
     <div class="dialog-body inline-form">
       <input type="text" name="name" placeholder="Name" required autofocus>
       <input type="email" name="email" placeholder="Email">
       <input type="text" name="phone" placeholder="Phone">
       <input type="text" name="company" placeholder="Company">
       <select name="status">
-        %for s in statuses:
-          <option value="{{s}}">{{status_label(s)}}</option>
-        %end
+        {% for s in statuses %}
+          <option value="{{ s }}">{{ status_label(s) }}</option>
+        {% endfor %}
       </select>
       <textarea name="notes" placeholder="Notes"></textarea>
     </div>
@@ -53,37 +56,38 @@
   <thead>
     <tr>
       <th>Name</th><th>Company</th><th>Email</th><th>Status</th>
-      %if showing_deleted:
+      {% if showing_deleted %}
         <th></th>
-      %end
+      {% endif %}
     </tr>
   </thead>
   <tbody>
-    %for c in clients:
-      %if showing_deleted:
+    {% for c in clients %}
+      {% if showing_deleted %}
         <tr>
-          <td><a href="{{url_for('client_detail', client_id=c.id)}}">{{c.name}}</a></td>
-          <td>{{c.company}}</td>
-          <td>{{c.email}}</td>
-          <td><span class="badge badge-{{c.status}}"><i class="dot"></i>{{status_label(c.status)}}</span></td>
+          <td><a href="{{ url_for('client_detail', client_id=c.id) }}">{{ c.name }}</a></td>
+          <td>{{ c.company }}</td>
+          <td>{{ c.email }}</td>
+          <td><span class="badge badge-{{ c.status }}"><i class="dot"></i>{{ status_label(c.status) }}</span></td>
           <td>
-            <form method="post" action="{{url_for('client_restore', client_id=c.id)}}" class="inline-form">
-              <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+            <form method="post" action="{{ url_for('client_restore', client_id=c.id) }}" class="inline-form">
+              <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
               <button class="btn-link" type="submit">Restore</button>
             </form>
           </td>
         </tr>
-      %else:
-        <tr onclick="location.href='{{url_for('client_detail', client_id=c.id)}}'">
-          <td>{{c.name}}</td>
-          <td>{{c.company}}</td>
-          <td>{{c.email}}</td>
-          <td><span class="badge badge-{{c.status}}"><i class="dot"></i>{{status_label(c.status)}}</span></td>
+      {% else %}
+        <tr onclick="location.href='{{ url_for('client_detail', client_id=c.id) }}'">
+          <td>{{ c.name }}</td>
+          <td>{{ c.company }}</td>
+          <td>{{ c.email }}</td>
+          <td><span class="badge badge-{{ c.status }}"><i class="dot"></i>{{ status_label(c.status) }}</span></td>
         </tr>
-      %end
-    %end
-    %if not clients:
-      <tr><td colspan="{{5 if showing_deleted else 4}}" class="muted">{{'No deleted clients.' if showing_deleted else 'No clients yet.'}}</td></tr>
-    %end
+      {% endif %}
+    {% endfor %}
+    {% if not clients %}
+      <tr><td colspan="{{ 5 if showing_deleted else 4 }}" class="muted">{{ 'No deleted clients.' if showing_deleted else 'No clients yet.' }}</td></tr>
+    {% endif %}
   </tbody>
 </table>
+{% endblock %}

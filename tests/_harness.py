@@ -1,14 +1,16 @@
 """Shared plumbing for the user-journey tests in this folder — not a test
 file itself (leading underscore, same convention as pages/_shared.py).
 
-Each journey runs the *real* app, as a real web server, against a
+Each journey runs the *real* app, as a real ASGI server (uvicorn, on a
+background thread's own event loop — see Journey.setUpClass), against a
 throwaway Postgres database (created and dropped around the test, see
 _create_test_database/_drop_test_database below), and drives it the way a
 person would: look at a page, fill in a form, submit it, see where it
-lands. No mocks — unittest, urllib, wsgiref, all standard library — plus
-psycopg2 (this tier's one real pip dependency, see requirements.txt) to
-create/drop the throwaway database directly, ahead of anything peewee
-does.
+lands. Browser (below) talks to that server over real HTTP via stdlib
+urllib — server-implementation-agnostic, so it didn't need to change at
+all when the app itself moved from a WSGI dev server to uvicorn. asyncpg
+(not psycopg2 — see requirements.txt) creates/drops the throwaway database
+directly, ahead of anything peewee does.
 
 Requires a reachable Postgres server (PGHOST/PGPORT/PGUSER/PGPASSWORD, same
 defaults as models.py) with permission to CREATE DATABASE / DROP DATABASE —
@@ -24,19 +26,21 @@ job thread, and that only makes sense to do once per process.
 
 from __future__ import annotations
 
+import asyncio
 import http.cookiejar
 import os
 import re
 import sys
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from wsgiref.simple_server import WSGIRequestHandler, make_server
 
-import psycopg2
+import asyncpg
+import uvicorn
 
 PRO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -44,9 +48,10 @@ PRO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def _load_dotenv() -> None:
     """Same as app.py's/migrate.py's own _load_dotenv() — kept as a small,
     separate copy here for the same reason migrate.py gives for its own.
-    Needed here (unlike before Postgres) because _pg_admin_connect() below
-    runs ahead of `import app`, the thing that would otherwise load .env
-    for us — PGUSER/PGPASSWORD have to be in os.environ before it connects."""
+    Needed here (unlike before Postgres) because _create_test_database()
+    below runs ahead of `import app`, the thing that would otherwise load
+    .env for us — PGUSER/PGPASSWORD have to be in os.environ before it
+    connects."""
     path = os.path.join(PRO_DIR, ".env")
     if not os.path.exists(path):
         return
@@ -65,12 +70,12 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 
-def _pg_admin_connect():
+async def _pg_admin_connect():
     """A connection to the "postgres" maintenance database — CREATE
     DATABASE / DROP DATABASE can't run against the database being
     created/dropped itself."""
-    return psycopg2.connect(
-        dbname="postgres",
+    return await asyncpg.connect(
+        database="postgres",
         host=os.environ.get("PGHOST", "localhost"),
         port=int(os.environ.get("PGPORT", 5432)),
         user=os.environ.get("PGUSER") or None,
@@ -78,46 +83,32 @@ def _pg_admin_connect():
     )
 
 
-def _create_test_database(name: str) -> None:
-    conn = _pg_admin_connect()
-    conn.autocommit = True  # CREATE DATABASE can't run inside a transaction
+async def _create_test_database(name: str) -> None:
+    conn = await _pg_admin_connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute(f'CREATE DATABASE "{name}"')
+        await conn.execute(f'CREATE DATABASE "{name}"')
     finally:
-        conn.close()
+        await conn.close()
 
 
-def _drop_test_database(name: str) -> None:
-    conn = _pg_admin_connect()
-    conn.autocommit = True  # same as above, plus each statement here needs to land immediately
+async def _drop_test_database(name: str) -> None:
+    conn = await _pg_admin_connect()
     try:
-        with conn.cursor() as cur:
-            # DROP DATABASE fails while any session is attached — the app's
-            # own connections close per-request (see app.py's
-            # before_request/after_request hooks) and jobs.py's poller
-            # closes between iterations, but this journey's background job
-            # thread (daemon, outlives tearDownClass) could still be mid-poll
-            # and holding one open. Force the issue rather than let a slow
-            # teardown fail run_all.py.
-            cur.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = %s AND pid <> pg_backend_pid()",
-                (name,),
-            )
-            cur.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        # DROP DATABASE fails while any session is attached — the app's
+        # own connections close per-request (see app.py's
+        # before_request/after_request hooks) and jobs.py's poller closes
+        # between iterations, but this journey's background job thread
+        # (daemon, outlives tearDownClass) could still be mid-poll and
+        # holding one open. Force the issue rather than let a slow teardown
+        # fail run_all.py.
+        await conn.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = $1 AND pid <> pg_backend_pid()",
+            name,
+        )
+        await conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
     finally:
-        conn.close()
-
-
-class _QuietHandler(WSGIRequestHandler):
-    """The same server, minus a log line printed for every request a
-    journey makes — a passing test run should be quiet."""
-
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *args) -> None:
-        pass
+        await conn.close()
 
 
 class Journey(unittest.TestCase):
@@ -138,11 +129,23 @@ class Journey(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls._db_name = f"scalar_journey_{uuid.uuid4().hex[:16]}"
-        _create_test_database(cls._db_name)
+
+        # A dedicated event loop on its own thread, kept alive for this
+        # whole test file — every request the ASGI server below handles
+        # runs as a task on *this* loop, matching production's shape (one
+        # loop, one task per request), which is what playhouse.pwasyncio's
+        # per-task connection state (see models.py) requires.
+        cls._loop = asyncio.new_event_loop()
+        cls._loop_thread = threading.Thread(target=cls._loop.run_forever, name="journey-loop", daemon=True)
+        cls._loop_thread.start()
+
+        def run(coro):
+            return asyncio.run_coroutine_threadsafe(coro, cls._loop).result()
+
+        run(_create_test_database(cls._db_name))
         os.environ["PGDATABASE"] = cls._db_name
 
         sys.path.insert(0, PRO_DIR)
-        sys.path.insert(0, os.path.join(PRO_DIR, "vendor"))
 
         # Migrate *before* `import app` below, not after: importing app.py
         # starts jobs.py's background thread as a side effect, unconditionally
@@ -153,19 +156,29 @@ class Journey(unittest.TestCase):
         # the same one `make db-migrate` is, then serve.
         from models import run_migrations
 
-        run_migrations()
+        run(run_migrations())
 
         import app as appmod  # the real app, imported fresh in this process
 
-        cls._server = make_server("127.0.0.1", 0, appmod.app, handler_class=_QuietHandler)
-        cls._thread = threading.Thread(target=cls._server.serve_forever, daemon=True)
-        cls._thread.start()
-        cls.base_url = f"http://127.0.0.1:{cls._server.server_port}"
+        config = uvicorn.Config(appmod.app, host="127.0.0.1", port=0, log_config=None, access_log=False)
+        cls._server = uvicorn.Server(config)
+        cls._serve_future = asyncio.run_coroutine_threadsafe(cls._server.serve(), cls._loop)
+        for _ in range(500):  # up to 5s
+            if cls._server.started:
+                break
+            time.sleep(0.01)
+        else:
+            raise RuntimeError("uvicorn didn't start within 5s")
+        port = cls._server.servers[0].sockets[0].getsockname()[1]
+        cls.base_url = f"http://127.0.0.1:{port}"
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls._server.shutdown()
-        _drop_test_database(cls._db_name)
+        cls._server.should_exit = True
+        cls._serve_future.result(timeout=5)
+        asyncio.run_coroutine_threadsafe(_drop_test_database(cls._db_name), cls._loop).result()
+        cls._loop.call_soon_threadsafe(cls._loop.stop)
+        cls._loop_thread.join(timeout=5)
 
     def setUp(self) -> None:
         self.browser = Browser(self.base_url)
