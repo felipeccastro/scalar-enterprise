@@ -1,0 +1,52 @@
+%rebase('layout', title='Audit Log', back_url=url_for('dashboard'))
+<div class="page-header">
+  <h1>Audit Log</h1>
+</div>
+<p class="muted">Every create, update, and delete on a record that keeps
+  one — automatic, field-level, and separate from the Activity feed on
+  each record's own page.</p>
+
+%if entries:
+  <ul class="audit-list">
+    %for e in entries:
+      <li class="audit-entry">
+        <div class="audit-entry-head">
+          <span class="badge badge-{{e['action']}}"><i class="dot"></i>{{e['action'].title()}}</span>
+          <a href="{{e['url']}}">{{e['subject_type'].title()}} #{{e['subject_id']}}</a>
+          <span class="muted">{{e['actor']}} &middot; {{e['created_at'].strftime('%b %d, %Y %H:%M')}}</span>
+        </div>
+        %if e['changes']:
+          <details class="audit-diff">
+            %n = len(e['changes'])
+            <summary>{{n}} field{{'' if n == 1 else 's'}}</summary>
+            <table class="audit-diff-table">
+              <thead><tr><th>Field</th><th>Old</th><th>New</th></tr></thead>
+              <tbody>
+                %for field, diff in e['changes'].items():
+                  <tr>
+                    <td>{{field}}</td>
+                    <td class="muted">{{diff['old'] if diff['old'] is not None else '—'}}</td>
+                    <td>{{diff['new'] if diff['new'] is not None else '—'}}</td>
+                  </tr>
+                %end
+              </tbody>
+            </table>
+          </details>
+        %end
+      </li>
+    %end
+  </ul>
+
+  %if has_prev or has_next:
+    <div class="pager">
+      %if has_prev:
+        <a class="btn-link" href="{{url_for('audit_log', _query={'page': page - 1})}}">&larr; Newer</a>
+      %end
+      %if has_next:
+        <a class="btn-link" href="{{url_for('audit_log', _query={'page': page + 1})}}">Older &rarr;</a>
+      %end
+    </div>
+  %end
+%else:
+  <p class="muted">Nothing's been recorded yet.</p>
+%end
